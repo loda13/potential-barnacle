@@ -143,7 +143,12 @@ def fetch_stock_data(code: str, period: str, days: int, retry: int = 3, demo: bo
                 try:
                     return fetch_data_akshare(code, period, days)
                 except Exception as e:
-                    print(f"akshare获取失败: {e}")
+                    # 简化错误提示，避免打印冗长的堆栈信息
+                    error_msg = str(e)
+                    if 'proxy' in error_msg.lower() or 'connection' in error_msg.lower():
+                        print("akshare网络连接失败，正在切换备用数据源...")
+                    else:
+                        print(f"akshare获取失败，正在切换备用数据源...")
                     # 备用yfinance
                     return fetch_data_yfinance(code, period, days)
             else:
