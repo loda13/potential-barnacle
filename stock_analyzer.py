@@ -1029,8 +1029,19 @@ def format_volume(volume) -> str:
 
 def print_analysis(df: pd.DataFrame, code: str, period: str):
     """打印分析结果"""
-    if len(df) < 30:
-        print("错误：数据不足，请增加天数参数（至少需要30天）")
+    # 根据周期类型设置最小数据点要求
+    min_data_points = 30
+    if len(df) < min_data_points:
+        if period == 'w':
+            suggested_days = min_data_points * 7 + 30  # 周线需要更多日历天数
+            print(f"错误：数据不足，当前仅获取 {len(df)} 条周线数据，至少需要 {min_data_points} 条")
+            print(f"建议：使用 -d {suggested_days} 或更大的天数参数")
+        elif period == 'm':
+            suggested_days = min_data_points * 30 + 60  # 月线需要更多日历天数
+            print(f"错误：数据不足，当前仅获取 {len(df)} 条月线数据，至少需要 {min_data_points} 条")
+            print(f"建议：使用 -d {suggested_days} 或更大的天数参数")
+        else:
+            print("错误：数据不足，请增加天数参数（至少需要30天）")
         return
 
     # 计算指标
