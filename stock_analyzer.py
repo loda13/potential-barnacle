@@ -8,96 +8,264 @@
 import argparse
 import sys
 import time
-from typing import Tuple, Dict, List
+import re
+from typing import Tuple, Dict, List, Optional
 
 import pandas as pd
 import numpy as np
 
 
-def fetch_data_yfinance(code: str, period: str, days: int) -> pd.DataFrame:
-    """使用yfinance获取股票数据"""
-    import yfinance as yf
+# ============ 数据清洗函数 ============
 
-    # A股代码转换
-    original_code = code
-    if code.isdigit() and len(code) == 6:
-        if code.startswith(('6', '5', '9')):
-            code = f"{code}.SS"
+def clean_stock_data(df: pd.DataFrame) -> pd.DataFrame:
+    """统一数据清洗流程
+
+    Args:
+        df: 原始数据DataFrame
+
+    Returns:
+        清洗后的DataFrame
+    """
+    if df is None or df.empty:
+        return df
+
+    df = df.copy()
+
+    # 确保必要列存在
+    required_cols = ['open', 'high', 'low', 'close', 'volume']
+    for col in required_cols:
+        if col not in df.columns:
+            return pd.DataFrame()  # 返回空DataFrame表示数据无效
+
+    # 转换数值类型
+    for col in required_cols:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    # 删除包含NaN的行
+    df = df.dropna(subset=required_cols)
+
+    # 过滤异常数据（价格为负或为零）
+    df = df[(df['close'] > 0) & (df['high'] > 0) & (df['low'] > 0) & (df['open'] > 0)]
+
+    # 确保high >= low
+    df = df[df['high'] >= df['low']]
+
+    # 按日期排序
+    if 'date' in df.columns:
+        df = df.sort_values('date').reset_index(drop=True)
+
+    return df
+
+
+# ============ 验证函数 ============
+
+def validate_stock_code(code: str) -> Tuple[bool, str]:
+    """验证股票代码格式
+
+    Returns:
+        (is_valid, error_message)
+    """
+    if not code:
+        return False, "股票代码不能为空"
+
+    # A股：6位数字
+    if re.match(r'^\d{6}$', code):
+        return True, ""
+
+    # 美股：1-5个大写字母
+    if re.match(r'^[A-Z]{1,5}$', code):
+        return True, ""
+
+    # 港股：4位数字 + .HK
+    if re.match(r'^\d{4}\.HK$', code):
+        return True, ""
+
+    return False, f"股票代码格式无效: {code}\n  A股: 6位数字 (如 600519)\n  美股: 1-5个大写字母 (如 AAPL)\n  港股: 4位数字.HK (如 0700.HK)"
+
+
+def validate_data(df: pd.DataFrame, min_rows: int = 100) -> Tuple[bool, str, pd.DataFrame]:
+    """验证数据是否满足分析要求
+
+    Args:
+        df: 数据DataFrame
+        min_rows: 最小数据行数
+
+    Returns:
+        (is_valid, error_message, cleaned_df)
+    """
+    if df is None or df.empty:
+        return False, "无法获取股票数据，请检查股票代码是否正确", pd.DataFrame()
+
+    # 统一数据清洗
+    df_clean = clean_stock_data(df)
+
+    if df_clean.empty:
+        return False, "数据清洗后无有效数据，请检查数据质量", pd.DataFrame()
+
+    if len(df_clean) < min_rows:
+        return False, f"数据不足，当前仅 {len(df_clean)} 条有效数据，建议使用 -d {min_rows + 50} 或更大的天数参数（至少需要 {min_rows} 条数据）", pd.DataFrame()
+
+    return True, "", df_clean
+
+
+def validate_indicators(df: pd.DataFrame) -> Tuple[bool, List[str]]:
+    """验证指标计算结果是否在合理范围内
+
+    Returns:
+        (is_valid, list_of_warnings)
+    """
+    warnings = []
+    last = df.iloc[-1]
+
+    # 检查关键指标是否为NaN
+    nan_indicators = []
+    for col in ['MA5', 'MA10', 'MA20', 'RSI', 'MACD', 'KDJ_K', 'ADX', 'ATR']:
+        if col in df.columns and pd.isna(last[col]):
+            nan_indicators.append(col)
+    if nan_indicators:
+        warnings.append(f"以下指标计算结果为空: {', '.join(nan_indicators)}")
+
+    # RSI范围检查 (0-100)
+    if 'RSI' in df.columns and pd.notna(last['RSI']):
+        if last['RSI'] < 0 or last['RSI'] > 100:
+            warnings.append(f"RSI值异常: {last['RSI']:.2f} (应在0-100之间)")
+
+    # KDJ范围检查 (通常0-100，允许略微超出)
+    for col in ['KDJ_K', 'KDJ_D', 'KDJ_J']:
+        if col in df.columns and pd.notna(last[col]):
+            if last[col] < -20 or last[col] > 120:
+                warnings.append(f"{col}值异常: {last[col]:.2f}")
+
+    # ADX范围检查 (0-100)
+    if 'ADX' in df.columns and pd.notna(last['ADX']):
+        if last['ADX'] < 0 or last['ADX'] > 100:
+            warnings.append(f"ADX值异常: {last['ADX']:.2f} (应在0-100之间)")
+
+    # CCI范围检查 (通常-300到+300)
+    if 'CCI' in df.columns and pd.notna(last['CCI']):
+        if last['CCI'] < -500 or last['CCI'] > 500:
+            warnings.append(f"CCI值异常: {last['CCI']:.2f}")
+
+    return len(warnings) == 0, warnings
+
+
+def safe_fetch_yfinance(code: str, period: str, days: int) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    """安全获取yfinance数据，带错误处理
+
+    Returns:
+        (dataframe, error_message)
+    """
+    try:
+        import yfinance as yf
+    except ImportError:
+        return None, "请安装yfinance: pip install yfinance"
+
+    try:
+        # A股代码转换
+        original_code = code
+        yf_code = code
+        if code.isdigit() and len(code) == 6:
+            if code.startswith(('6', '5', '9')):
+                yf_code = f"{code}.SS"
+            else:
+                yf_code = f"{code}.SZ"
+
+        # 映射周期
+        interval = '1d' if period == 'd' else '1wk'
+
+        # 获取数据 (多获取一些以确保有足够数据计算指标)
+        fetch_days = days + 100
+        ticker = yf.Ticker(yf_code)
+        df = ticker.history(period=f"{fetch_days}d", interval=interval)
+
+        if df.empty:
+            return None, f"股票代码无效或无数据: {original_code}"
+
+        df = df.reset_index()
+        df = df.rename(columns={
+            'Date': 'date',
+            'Open': 'open',
+            'Close': 'close',
+            'High': 'high',
+            'Low': 'low',
+            'Volume': 'volume'
+        })
+
+        df['date'] = pd.to_datetime(df['date'])
+
+        # 取最近N条
+        df = df.tail(days).reset_index(drop=True)
+
+        return df[['date', 'open', 'high', 'low', 'close', 'volume']], None
+
+    except Exception as e:
+        error_msg = str(e).lower()
+        if 'connection' in error_msg or 'network' in error_msg or 'timeout' in error_msg:
+            return None, "网络连接失败，请检查网络后重试"
+        elif 'rate' in error_msg or 'limit' in error_msg:
+            return None, "API请求频率限制，请稍后重试"
         else:
-            code = f"{code}.SZ"
-
-    # 映射周期
-    interval = '1d' if period == 'd' else '1wk'
-
-    # 获取数据 (多获取一些以确保有足够数据计算指标)
-    fetch_days = days + 50
-    ticker = yf.Ticker(code)
-    df = ticker.history(period=f"{fetch_days}d", interval=interval)
-
-    if df.empty:
-        raise ValueError(f"无法获取股票数据: {original_code}")
-
-    df = df.reset_index()
-    df = df.rename(columns={
-        'Date': 'date',
-        'Open': 'open',
-        'Close': 'close',
-        'High': 'high',
-        'Low': 'low',
-        'Volume': 'volume'
-    })
-
-    # 取最近N条
-    df = df.tail(days).reset_index(drop=True)
-    df['date'] = pd.to_datetime(df['date'])
-    return df[['date', 'open', 'high', 'low', 'close', 'volume']]
+            return None, f"获取数据失败: {original_code}"
 
 
-def fetch_data_akshare(code: str, period: str, days: int) -> pd.DataFrame:
-    """使用akshare获取A股数据"""
+def safe_fetch_akshare(code: str, period: str, days: int) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    """安全获取akshare数据，带错误处理
+
+    Returns:
+        (dataframe, error_message)
+    """
     try:
         import akshare as ak
     except ImportError:
-        raise ImportError("请安装akshare: pip install akshare")
+        return None, "请安装akshare: pip install akshare"
 
-    # 判断市场
-    if code.startswith(('6', '5', '9')):
-        symbol = f"sh{code}"
-    else:
-        symbol = f"sz{code}"
+    try:
+        # 判断市场
+        if code.startswith(('6', '5', '9')):
+            symbol = f"sh{code}"
+        else:
+            symbol = f"sz{code}"
 
-    # 获取数据
-    period_str = "daily" if period == 'd' else "weekly"
-    df = ak.stock_zh_a_hist(symbol=symbol, period=period_str, adjust="qfq")
+        # 获取数据
+        period_str = "daily" if period == 'd' else "weekly"
+        df = ak.stock_zh_a_hist(symbol=symbol, period=period_str, adjust="qfq")
 
-    # 取最近N天
-    df = df.tail(days).reset_index(drop=True)
+        # 标准化列名 - 处理不同版本的列名
+        column_mapping = {}
+        for col in df.columns:
+            col_lower = col.lower()
+            if '日期' in col or 'date' in col_lower:
+                column_mapping[col] = 'date'
+            elif '开盘' in col or 'open' in col_lower:
+                column_mapping[col] = 'open'
+            elif '收盘' in col or 'close' in col_lower:
+                column_mapping[col] = 'close'
+            elif '最高' in col or 'high' in col_lower:
+                column_mapping[col] = 'high'
+            elif '最低' in col or 'low' in col_lower:
+                column_mapping[col] = 'low'
+            elif '成交' in col and ('量' in col or 'volume' in col_lower):
+                column_mapping[col] = 'volume'
 
-    # 标准化列名 - 处理不同版本的列名
-    column_mapping = {}
-    for col in df.columns:
-        col_lower = col.lower()
-        if '日期' in col or 'date' in col_lower:
-            column_mapping[col] = 'date'
-        elif '开盘' in col or 'open' in col_lower:
-            column_mapping[col] = 'open'
-        elif '收盘' in col or 'close' in col_lower:
-            column_mapping[col] = 'close'
-        elif '最高' in col or 'high' in col_lower:
-            column_mapping[col] = 'high'
-        elif '最低' in col or 'low' in col_lower:
-            column_mapping[col] = 'low'
-        elif '成交' in col and ('量' in col or 'volume' in col_lower):
-            column_mapping[col] = 'volume'
+        df = df.rename(columns=column_mapping)
 
-    df = df.rename(columns=column_mapping)
+        if 'date' not in df.columns:
+            # 尝试使用第一列作为日期
+            df = df.rename(columns={df.columns[0]: 'date'})
 
-    if 'date' not in df.columns:
-        # 尝试使用第一列作为日期
-        df = df.rename(columns={df.columns[0]: 'date'})
+        df['date'] = pd.to_datetime(df['date'])
 
-    df['date'] = pd.to_datetime(df['date'])
-    return df[['date', 'open', 'high', 'low', 'close', 'volume']]
+        # 取最近N天
+        df = df.tail(days).reset_index(drop=True)
+
+        return df[['date', 'open', 'high', 'low', 'close', 'volume']], None
+
+    except Exception as e:
+        error_msg = str(e).lower()
+        if 'connection' in error_msg or 'network' in error_msg or 'timeout' in error_msg or 'proxy' in error_msg:
+            return None, "网络连接失败，请检查网络后重试"
+        else:
+            return None, f"获取数据失败: {code}"
 
 
 def generate_demo_data(code: str, period: str, days: int) -> pd.DataFrame:
@@ -127,42 +295,45 @@ def generate_demo_data(code: str, period: str, days: int) -> pd.DataFrame:
 
 
 def fetch_stock_data(code: str, period: str, days: int, retry: int = 3, demo: bool = False) -> pd.DataFrame:
-    """获取股票数据，自动判断A股或美股"""
+    """获取股票数据，优先使用yfinance，失败后尝试akshare（仅A股）
+
+    数据源优先级：
+    1. yfinance（支持A股、美股、港股）
+    2. akshare（仅A股备选）
+    """
     if demo:
         print("使用演示数据模式")
         return generate_demo_data(code, period, days)
 
     is_a_share = code.isdigit() and len(code) == 6
 
-    last_error = None
-
     for attempt in range(retry):
-        try:
-            if is_a_share:
-                # A股优先用akshare
-                try:
-                    return fetch_data_akshare(code, period, days)
-                except Exception as e:
-                    # 简化错误提示，避免打印冗长的堆栈信息
-                    error_msg = str(e)
-                    if 'proxy' in error_msg.lower() or 'connection' in error_msg.lower():
-                        print("akshare网络连接失败，正在切换备用数据源...")
-                    else:
-                        print(f"akshare获取失败，正在切换备用数据源...")
-                    # 备用yfinance
-                    return fetch_data_yfinance(code, period, days)
-            else:
-                return fetch_data_yfinance(code, period, days)
-        except Exception as e:
-            last_error = e
-            if "Rate limited" in str(e) or "Too Many Requests" in str(e):
-                wait_time = (attempt + 1) * 10
-                print(f"API限速，等待{wait_time}秒后重试... ({attempt + 1}/{retry})")
-                time.sleep(wait_time)
-            else:
-                raise
+        # 优先使用yfinance
+        df, error = safe_fetch_yfinance(code, period, days)
 
-    raise last_error
+        if df is not None:
+            print(f"数据源: yfinance")
+            return df
+
+        # yfinance失败，如果是A股则尝试akshare
+        if is_a_share:
+            print(f"yfinance获取失败，正在尝试akshare...")
+            df, error = safe_fetch_akshare(code, period, days)
+
+            if df is not None:
+                print(f"数据源: akshare")
+                return df
+
+        # 检查是否是限速错误
+        if error and ("限" in error or "limit" in error.lower()):
+            wait_time = (attempt + 1) * 10
+            print(f"API限速，等待{wait_time}秒后重试... ({attempt + 1}/{retry})")
+            time.sleep(wait_time)
+        else:
+            # 非限速错误，直接报错退出
+            raise ValueError(error if error else "获取数据失败，请检查股票代码或网络连接")
+
+    raise ValueError("多次重试后仍无法获取数据，请稍后再试")
 
 
 # ============ 技术指标计算函数 ============
@@ -178,16 +349,30 @@ def calc_ema(series: pd.Series, length: int) -> pd.Series:
 
 
 def calc_rsi(series: pd.Series, length: int = 14) -> pd.Series:
-    """RSI相对强弱指标"""
+    """RSI相对强弱指标 - 使用Wilder平滑法
+
+    Args:
+        series: 价格序列
+        length: 计算周期，默认14
+
+    Returns:
+        RSI值序列
+    """
     delta = series.diff()
     gain = delta.where(delta > 0, 0)
     loss = (-delta).where(delta < 0, 0)
 
-    avg_gain = gain.rolling(window=length).mean()
-    avg_loss = loss.rolling(window=length).mean()
+    # 使用EMA（Wilder方法）- alpha = 1/length
+    avg_gain = gain.ewm(alpha=1/length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/length, adjust=False).mean()
 
-    rs = avg_gain / avg_loss
+    # 防止除零错误
+    rs = avg_gain / avg_loss.replace(0, np.inf)
     rsi = 100 - (100 / (1 + rs))
+
+    # 处理无穷大和NaN
+    rsi = rsi.replace([np.inf, -np.inf], np.nan)
+
     return rsi
 
 
@@ -211,64 +396,133 @@ def calc_bollinger_bands(series: pd.Series, length: int = 20, std_dev: float = 2
 
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """计算所有技术指标（纯pandas/numpy实现）"""
+    """计算所有技术指标（纯pandas/numpy实现）
+
+    带有错误处理，单个指标计算失败不会影响其他指标
+    """
     df = df.copy()
 
     # 移动平均线
-    df['MA5'] = calc_sma(df['close'], 5)
-    df['MA10'] = calc_sma(df['close'], 10)
-    df['MA20'] = calc_sma(df['close'], 20)
+    try:
+        df['MA5'] = calc_sma(df['close'], 5)
+        df['MA10'] = calc_sma(df['close'], 10)
+        df['MA20'] = calc_sma(df['close'], 20)
+    except Exception:
+        df['MA5'] = np.nan
+        df['MA10'] = np.nan
+        df['MA20'] = np.nan
 
     # RSI
-    df['RSI'] = calc_rsi(df['close'], 14)
+    try:
+        df['RSI'] = calc_rsi(df['close'], 14)
+    except Exception:
+        df['RSI'] = np.nan
 
     # MACD
-    df['MACD'], df['MACD_signal'], df['MACD_hist'] = calc_macd(df['close'])
+    try:
+        df['MACD'], df['MACD_signal'], df['MACD_hist'] = calc_macd(df['close'])
+    except Exception:
+        df['MACD'] = np.nan
+        df['MACD_signal'] = np.nan
+        df['MACD_hist'] = np.nan
 
     # 布林带
-    df['BB_upper'], df['BB_middle'], df['BB_lower'] = calc_bollinger_bands(df['close'])
+    try:
+        df['BB_upper'], df['BB_middle'], df['BB_lower'] = calc_bollinger_bands(df['close'])
+    except Exception:
+        df['BB_upper'] = np.nan
+        df['BB_middle'] = np.nan
+        df['BB_lower'] = np.nan
 
     # ========== 新增指标（纯pandas实现） ==========
 
     # KDJ指标
-    df = calc_kdj(df)
+    try:
+        df = calc_kdj(df)
+    except Exception:
+        df['KDJ_K'] = np.nan
+        df['KDJ_D'] = np.nan
+        df['KDJ_J'] = np.nan
 
     # ADX指标（平均趋向指数）
-    df = calc_adx(df)
+    try:
+        df = calc_adx(df)
+    except Exception:
+        df['ADX'] = np.nan
+        df['ADX_PDI'] = np.nan
+        df['ADX_NDI'] = np.nan
 
     # ATR指标（平均真实波幅）
-    df['ATR'] = calc_atr(df)
+    try:
+        df['ATR'] = calc_atr(df)
+    except Exception:
+        df['ATR'] = np.nan
 
     # OBV指标（能量潮）
-    df['OBV'] = calc_obv(df)
-    df['OBV_MA'] = calc_sma(df['OBV'], 20)
+    try:
+        df['OBV'] = calc_obv(df)
+        df['OBV_MA'] = calc_sma(df['OBV'], 20)
+    except Exception:
+        df['OBV'] = np.nan
+        df['OBV_MA'] = np.nan
 
     # CCI指标（顺势指标）
-    df['CCI'] = calc_cci(df)
+    try:
+        df['CCI'] = calc_cci(df)
+    except Exception:
+        df['CCI'] = np.nan
 
     # SuperTrend指标
-    df = calc_supertrend(df)
+    try:
+        df = calc_supertrend(df)
+    except Exception:
+        df['SuperTrend'] = np.nan
+        df['SuperTrend_dir'] = np.nan
 
     # PSAR指标（抛物线转向）
-    df = calc_psar(df)
+    try:
+        df = calc_psar(df)
+    except Exception:
+        df['PSAR'] = np.nan
+        df['PSAR_dir'] = np.nan
 
     # Ichimoku云图（一目均衡表）
-    df = calc_ichimoku(df)
+    try:
+        df = calc_ichimoku(df)
+    except Exception:
+        df['ICH_TENKAN'] = np.nan
+        df['ICH_KIJUN'] = np.nan
+        df['ICH_SSA'] = np.nan
+        df['ICH_SSB'] = np.nan
 
     return df
 
 
 def calc_kdj(df: pd.DataFrame, n: int = 9, m1: int = 3, m2: int = 3) -> pd.DataFrame:
-    """KDJ指标计算"""
+    """KDJ指标计算 - 添加除零保护
+
+    Args:
+        df: 包含high, low, close的DataFrame
+        n: RSV计算周期，默认9
+        m1: K值平滑周期，默认3
+        m2: D值平滑周期，默认3
+
+    Returns:
+        添加了KDJ指标的DataFrame
+    """
     low_n = df['low'].rolling(window=n).min()
     high_n = df['high'].rolling(window=n).max()
 
-    rsv = (df['close'] - low_n) / (high_n - low_n) * 100
-    rsv = rsv.fillna(50)
+    # 除零保护：当high_n == low_n时，RSV取平衡点50
+    denom = high_n - low_n
+    rsv = np.where(denom != 0,
+                   (df['close'] - low_n) / denom * 100,
+                   50.0)  # 平衡点
+    rsv = pd.Series(rsv, index=df.index).fillna(50)
 
-    # K值 = RSV的M1日移动平均
+    # K值 = RSV的M1日指数移动平均
     df['KDJ_K'] = rsv.ewm(alpha=1/m1, adjust=False).mean()
-    # D值 = K值的M2日移动平均
+    # D值 = K值的M2日指数移动平均
     df['KDJ_D'] = df['KDJ_K'].ewm(alpha=1/m2, adjust=False).mean()
     # J值 = 3*K - 2*D
     df['KDJ_J'] = 3 * df['KDJ_K'] - 2 * df['KDJ_D']
@@ -277,7 +531,15 @@ def calc_kdj(df: pd.DataFrame, n: int = 9, m1: int = 3, m2: int = 3) -> pd.DataF
 
 
 def calc_adx(df: pd.DataFrame, n: int = 14) -> pd.DataFrame:
-    """ADX平均趋向指数计算"""
+    """ADX平均趋向指数计算 - 修正Series索引问题
+
+    Args:
+        df: 包含high, low, close的DataFrame
+        n: 计算周期，默认14
+
+    Returns:
+        添加了ADX指标的DataFrame
+    """
     high = df['high']
     low = df['low']
     close = df['close']
@@ -289,6 +551,10 @@ def calc_adx(df: pd.DataFrame, n: int = 14) -> pd.DataFrame:
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
 
+    # 保持索引一致 - 修正点
+    plus_dm = pd.Series(plus_dm, index=df.index)
+    minus_dm = pd.Series(minus_dm, index=df.index)
+
     # TR (True Range)
     tr1 = high - low
     tr2 = abs(high - close.shift(1))
@@ -297,11 +563,16 @@ def calc_adx(df: pd.DataFrame, n: int = 14) -> pd.DataFrame:
 
     # 平滑
     atr = tr.ewm(alpha=1/n, adjust=False).mean()
-    plus_di = 100 * pd.Series(plus_dm).ewm(alpha=1/n, adjust=False).mean() / atr
-    minus_di = 100 * pd.Series(minus_dm).ewm(alpha=1/n, adjust=False).mean() / atr
+
+    # 防止除零
+    atr_safe = atr.replace(0, np.inf)
+    plus_di = 100 * plus_dm.ewm(alpha=1/n, adjust=False).mean() / atr_safe
+    minus_di = 100 * minus_dm.ewm(alpha=1/n, adjust=False).mean() / atr_safe
 
     # DX
-    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+    di_sum = plus_di + minus_di
+    di_sum = di_sum.replace(0, np.inf)  # 防止除零
+    dx = 100 * abs(plus_di - minus_di) / di_sum
     df['ADX'] = dx.ewm(alpha=1/n, adjust=False).mean()
     df['ADX_PDI'] = plus_di
     df['ADX_NDI'] = minus_di
@@ -324,31 +595,45 @@ def calc_atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
 
 
 def calc_obv(df: pd.DataFrame) -> pd.Series:
-    """OBV能量潮计算"""
+    """OBV能量潮计算 - 向量化优化
+
+    Args:
+        df: 包含close, volume的DataFrame
+
+    Returns:
+        OBV序列
+    """
     close = df['close']
     volume = df['volume']
 
-    obv = pd.Series(0.0, index=df.index)
-    obv.iloc[0] = volume.iloc[0]
+    # 向量化计算：根据价格变化方向决定成交量正负
+    direction = np.sign(close.diff())
+    direction.iloc[0] = 1  # 第一个值设为正
 
-    for i in range(1, len(df)):
-        if close.iloc[i] > close.iloc[i-1]:
-            obv.iloc[i] = obv.iloc[i-1] + volume.iloc[i]
-        elif close.iloc[i] < close.iloc[i-1]:
-            obv.iloc[i] = obv.iloc[i-1] - volume.iloc[i]
-        else:
-            obv.iloc[i] = obv.iloc[i-1]
+    # 累加得到OBV
+    obv = (direction * volume).cumsum()
 
     return obv
 
 
 def calc_cci(df: pd.DataFrame, n: int = 20) -> pd.Series:
-    """CCI顺势指标计算"""
+    """CCI顺势指标计算
+
+    Args:
+        df: 包含high, low, close的DataFrame
+        n: 计算周期，默认20
+
+    Returns:
+        CCI序列
+    """
     tp = (df['high'] + df['low'] + df['close']) / 3
     ma = tp.rolling(window=n).mean()
     md = tp.rolling(window=n).apply(lambda x: np.abs(x - x.mean()).mean())
 
-    cci = (tp - ma) / (0.015 * md)
+    # 防止除零
+    md_safe = md.replace(0, np.inf)
+    cci = (tp - ma) / (0.015 * md_safe)
+
     return cci
 
 
@@ -1032,26 +1317,79 @@ def format_volume(volume) -> str:
         return f"{volume:.0f}"
 
 
-def print_analysis(df: pd.DataFrame, code: str, period: str):
-    """打印分析结果"""
-    # 根据周期类型设置最小数据点要求
-    min_data_points = 30
-    if len(df) < min_data_points:
-        if period == 'w':
-            suggested_days = min_data_points * 7 + 30  # 周线需要更多日历天数
-            print(f"错误：数据不足，当前仅获取 {len(df)} 条周线数据，至少需要 {min_data_points} 条")
-            print(f"建议：使用 -d {suggested_days} 或更大的天数参数")
-        elif period == 'm':
-            suggested_days = min_data_points * 30 + 60  # 月线需要更多日历天数
-            print(f"错误：数据不足，当前仅获取 {len(df)} 条月线数据，至少需要 {min_data_points} 条")
-            print(f"建议：使用 -d {suggested_days} 或更大的天数参数")
-        else:
-            print("错误：数据不足，请增加天数参数（至少需要30天）")
-        return
+def format_table(rows: List[Tuple[str, str, str]], headers: Tuple[str, str, str] = ("指标", "最新值", "信号")) -> str:
+    """格式化表格输出
 
+    Args:
+        rows: [(指标名, 值, 信号状态), ...]
+        headers: 表头
+
+    Returns:
+        格式化的表格字符串
+    """
+    # 计算每列宽度
+    col_widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            col_widths[i] = max(col_widths[i], len(str(cell)))
+
+    # 构建表格
+    def make_border():
+        parts = ["┌"]
+        for i, w in enumerate(col_widths):
+            parts.append("─" * (w + 2))
+            if i < len(col_widths) - 1:
+                parts.append("┬")
+        parts.append("┐")
+        return "".join(parts)
+
+    def make_row(cells):
+        parts = ["│"]
+        for i, (cell, w) in enumerate(zip(cells, col_widths)):
+            parts.append(f" {str(cell):{w}} ")
+            if i < len(cells) - 1:
+                parts.append("│")
+        parts.append("│")
+        return "".join(parts)
+
+    def make_middle_border():
+        parts = ["├"]
+        for i, w in enumerate(col_widths):
+            parts.append("─" * (w + 2))
+            if i < len(col_widths) - 1:
+                parts.append("┼")
+        parts.append("┤")
+        return "".join(parts)
+
+    def make_bottom_border():
+        parts = ["└"]
+        for i, w in enumerate(col_widths):
+            parts.append("─" * (w + 2))
+            if i < len(col_widths) - 1:
+                parts.append("┴")
+        parts.append("┘")
+        return "".join(parts)
+
+    lines = [make_border(), make_row(headers), make_middle_border()]
+    for row in rows:
+        lines.append(make_row(row))
+    lines.append(make_bottom_border())
+
+    return "\n".join(lines)
+
+
+def print_analysis(df: pd.DataFrame, code: str, period: str):
+    """打印分析结果（表格格式）"""
     # 计算指标
     df = calculate_indicators(df)
     last = df.iloc[-1]
+
+    # 验证指标计算结果
+    is_valid, warnings = validate_indicators(df)
+    if warnings:
+        print("\n注意：部分指标计算异常")
+        for w in warnings:
+            print(f"  - {w}")
 
     # 分析
     trend = analyze_trend(df)
@@ -1079,53 +1417,70 @@ def print_analysis(df: pd.DataFrame, code: str, period: str):
     if pd.notna(last['ATR']):
         print(f"  ATR(14): {last['ATR']:.2f}")
 
-    # 基础技术指标
-    print(f"\n【基础指标】")
-    print(f"  MA5:  {last['MA5']:.2f}" if pd.notna(last['MA5']) else "  MA5:  N/A")
-    print(f"  MA10: {last['MA10']:.2f}" if pd.notna(last['MA10']) else "  MA10: N/A")
-    print(f"  MA20: {last['MA20']:.2f}" if pd.notna(last['MA20']) else "  MA20: N/A")
-    print(f"  RSI:  {last['RSI']:.2f}" if pd.notna(last['RSI']) else "  RSI:  N/A")
-    print(f"  MACD: {last['MACD']:.4f}" if pd.notna(last['MACD']) else "  MACD: N/A")
-    print(f"  布林上轨: {last['BB_upper']:.2f}" if pd.notna(last['BB_upper']) else "  布林上轨: N/A")
-    print(f"  布林下轨: {last['BB_lower']:.2f}" if pd.notna(last['BB_lower']) else "  布林下轨: N/A")
+    # 技术指标表格
+    print(f"\n【技术指标】")
+    table_rows = []
 
-    # 新增技术指标
-    print(f"\n【新增指标】")
+    # 基础指标
+    if pd.notna(last['MA5']):
+        ma_signal = "多头排列" if last['MA5'] > last['MA10'] > last['MA20'] else ("空头排列" if last['MA5'] < last['MA10'] < last['MA20'] else "-")
+        table_rows.append(("MA5", f"{last['MA5']:.2f}", ma_signal))
+    if pd.notna(last['MA10']):
+        table_rows.append(("MA10", f"{last['MA10']:.2f}", "-"))
+    if pd.notna(last['MA20']):
+        table_rows.append(("MA20", f"{last['MA20']:.2f}", "-"))
+
+    # RSI
+    if pd.notna(last['RSI']):
+        rsi_signal = "超卖" if last['RSI'] < 30 else ("超买" if last['RSI'] > 70 else "中性")
+        table_rows.append(("RSI(14)", f"{last['RSI']:.2f}", rsi_signal))
+
+    # MACD
+    if pd.notna(last['MACD']) and pd.notna(last['MACD_signal']):
+        macd_signal = "▲ 多头运行" if last['MACD'] > last['MACD_signal'] else "▼ 空头运行"
+        table_rows.append(("MACD", f"{last['MACD']:.2f}", macd_signal))
+
+    # 布林带
+    if pd.notna(last['BB_upper']) and pd.notna(last['BB_lower']):
+        bb_signal = "突破上轨" if last['close'] > last['BB_upper'] else ("跌破下轨" if last['close'] < last['BB_lower'] else "轨道内")
+        table_rows.append(("BOLL", f"{last['BB_middle']:.2f}", bb_signal))
+
     # KDJ
     if pd.notna(last['KDJ_K']):
-        print(f"  KDJ: K={last['KDJ_K']:.2f}, D={last['KDJ_D']:.2f}, J={last['KDJ_J']:.2f}")
+        kdj_signal = "超买" if last['KDJ_J'] > 80 else ("超卖" if last['KDJ_J'] < 20 else "中性")
+        table_rows.append(("KDJ", f"K={last['KDJ_K']:.1f}", kdj_signal))
+
     # ADX
     if pd.notna(last['ADX']):
-        print(f"  ADX: {last['ADX']:.2f} (+DI:{last['ADX_PDI']:.2f}, -DI:{last['ADX_NDI']:.2f})")
+        adx_signal = "多头趋势" if last['ADX_PDI'] > last['ADX_NDI'] else "空头趋势"
+        table_rows.append(("ADX", f"{last['ADX']:.1f}", adx_signal))
+
     # CCI
     if pd.notna(last['CCI']):
-        print(f"  CCI: {last['CCI']:.2f}")
+        cci_signal = "超买" if last['CCI'] > 100 else ("超卖" if last['CCI'] < -100 else "中性")
+        table_rows.append(("CCI", f"{last['CCI']:.1f}", cci_signal))
+
     # SuperTrend
     if pd.notna(last['SuperTrend']):
-        direction = "多头" if last['SuperTrend_dir'] == 1 else "空头"
-        print(f"  SuperTrend: {last['SuperTrend']:.2f} ({direction})")
+        st_signal = "▲ 多头" if last['SuperTrend_dir'] == 1 else "▼ 空头"
+        table_rows.append(("SuperTrend", f"{last['SuperTrend']:.2f}", st_signal))
+
     # PSAR
     if pd.notna(last['PSAR']):
-        direction = "多头" if last['PSAR_dir'] == 1 else "空头"
-        print(f"  PSAR: {last['PSAR']:.2f} ({direction})")
+        psar_signal = "▲ 多头" if last['PSAR_dir'] == 1 else "▼ 空头"
+        table_rows.append(("PSAR", f"{last['PSAR']:.2f}", psar_signal))
+
     # OBV
     if pd.notna(last['OBV']):
-        obv_trend = "↑" if last['OBV'] > last['OBV_MA'] else "↓"
-        print(f"  OBV: {format_volume(last['OBV'])} {obv_trend}")
+        obv_signal = "资金流入" if last['OBV'] > last['OBV_MA'] else "资金流出"
+        table_rows.append(("OBV", format_volume(last['OBV']), obv_signal))
+
     # Ichimoku
     if pd.notna(last['ICH_TENKAN']):
-        print(f"  Ichimoku: 转换线={last['ICH_TENKAN']:.2f}, 基准线={last['ICH_KIJUN']:.2f}")
+        ichi_signal = "云上" if last['close'] > max(last['ICH_SSA'], last['ICH_SSB']) else ("云下" if last['close'] < min(last['ICH_SSA'], last['ICH_SSB']) else "云中")
+        table_rows.append(("Ichimoku", f"{last['ICH_TENKAN']:.1f}", ichi_signal))
 
-    # 趋势分析
-    print(f"\n【趋势分析】")
-    print(f"  当前趋势: {trend}")
-
-    # 各指标信号详情
-    print(f"\n【各指标信号】")
-    signal_icons = {'buy': '▲', 'sell': '▼', 'neutral': '○'}
-    for name, info in indicators.items():
-        icon = signal_icons.get(info['signal'], '○')
-        print(f"  {icon} {name}: {info['status']}")
+    print(format_table(table_rows))
 
     # 多指标共振分析
     print(f"\n【多指标共振】")
@@ -1135,7 +1490,6 @@ def print_analysis(df: pd.DataFrame, code: str, period: str):
     print(f"  共振信号: {icon} {resonance['signal_text']}")
     print(f"  买入指标({len(resonance['buy_indicators'])}): {', '.join(resonance['buy_indicators']) if resonance['buy_indicators'] else '无'}")
     print(f"  卖出指标({len(resonance['sell_indicators'])}): {', '.join(resonance['sell_indicators']) if resonance['sell_indicators'] else '无'}")
-    print(f"  中性指标({len(resonance['neutral_indicators'])}): {', '.join(resonance['neutral_indicators']) if resonance['neutral_indicators'] else '无'}")
 
     # 综合胜率提示
     print(f"\n【综合胜率提示】")
@@ -1145,18 +1499,19 @@ def print_analysis(df: pd.DataFrame, code: str, period: str):
         print(f"  风险提示: {'; '.join(win_rate_info['risk_warnings'])}")
     print(f"  {win_rate_info['suggestion']}")
 
-    # 买卖信号汇总
-    print(f"\n【买卖信号】")
+    # 买卖信号表格
+    print(f"\n【交叉信号】")
+    cross_rows = []
     if signals['golden_cross']:
-        print(f"  金叉信号: {', '.join(signals['golden_cross'])}")
+        for gc in signals['golden_cross']:
+            cross_rows.append((gc, "金叉", "▲ 买入"))
     if signals['death_cross']:
-        print(f"  死叉信号: {', '.join(signals['death_cross'])}")
-    if signals['buy']:
-        print(f"  买入信号: {', '.join(signals['buy'])}")
-    if signals['sell']:
-        print(f"  卖出信号: {', '.join(signals['sell'])}")
-    if not any([signals['buy'], signals['sell'], signals['golden_cross'], signals['death_cross']]):
-        print("  暂无明确信号")
+        for dc in signals['death_cross']:
+            cross_rows.append((dc, "死叉", "▼ 卖出"))
+    if cross_rows:
+        print(format_table(cross_rows, ("信号", "类型", "方向")))
+    else:
+        print("  暂无金叉/死叉信号")
 
     # 支撑压力位
     print(f"\n【支撑压力位】")
@@ -1197,24 +1552,39 @@ def main():
     args = parser.parse_args()
 
     try:
+        # 验证股票代码格式
+        is_valid, error_msg = validate_stock_code(args.code)
+        if not is_valid:
+            print(f"错误: {error_msg}")
+            sys.exit(1)
+
         # 获取数据
         print(f"正在获取 {args.code} 数据...")
         df = fetch_stock_data(args.code, args.period, args.days, demo=args.demo)
 
         if df.empty:
-            print("错误：无法获取股票数据")
+            print("错误：无法获取股票数据，请检查股票代码是否正确")
             sys.exit(1)
 
-        print(f"成功获取 {len(df)} 条数据")
+        # 数据清洗和验证
+        is_valid, error_msg, df_clean = validate_data(df, min_rows=30)
+        if not is_valid:
+            print(f"错误: {error_msg}")
+            sys.exit(1)
+
+        print(f"成功获取 {len(df_clean)} 条有效数据")
 
         # 分析并输出
-        print_analysis(df, args.code, args.period)
+        print_analysis(df_clean, args.code, args.period)
 
     except KeyboardInterrupt:
         print("\n操作已取消")
         sys.exit(0)
-    except Exception as e:
+    except ValueError as e:
         print(f"错误: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"发生未知错误: {e}")
         sys.exit(1)
 
 
