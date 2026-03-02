@@ -5,7 +5,7 @@
 ## 安装
 
 ```bash
-pip install pandas numpy yfinance akshare
+pip3 install pandas numpy yfinance akshare
 ```
 
 > 注：已支持纯pandas/numpy实现，无需安装pandas_ta
@@ -17,7 +17,7 @@ pip install pandas numpy yfinance akshare
 python3 stock_analyzer.py 600519 -d 60
 
 # 美股周线（苹果，最近30周）
-python3 stock_analyzer.py AAPL -p w -d 30
+python3 stock_analyzer.py AAPL -p w -d 240
 
 # 港股（腾讯控股）
 python3 stock_analyzer.py 0700.HK -d 60
@@ -32,7 +32,7 @@ python3 stock_analyzer.py 600519 --demo
 |------|------|--------|
 | `code` | 股票代码（A股6位数字，美股如AAPL，港股如0700.HK） | 必填 |
 | `-p, --period` | K线周期：`d`=日线，`w`=周线 | `d` |
-| `-d, --days` | 分析天数/周数 | `60` |
+| `-d, --days` | 分析天数/周数（周线建议≥240） | `60` |
 | `--demo` | 演示模式，使用模拟数据 | 关闭 |
 
 ## 技术指标
