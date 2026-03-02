@@ -16,7 +16,7 @@ pip3 install pandas numpy yfinance akshare
 # A股日线（贵州茅台，最近60天）
 python3 stock_analyzer.py 600519 -d 60
 
-# 美股周线（苹果，最近30周）
+# 美股周线（苹果，获取约34周数据）
 python3 stock_analyzer.py AAPL -p w -d 240
 
 # 港股（腾讯控股）
