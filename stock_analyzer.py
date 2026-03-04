@@ -206,9 +206,10 @@ def safe_fetch_yfinance(code: str, period: str, days: int) -> Tuple[Optional[pd.
 
     except Exception as e:
         error_msg = str(e).lower()
+        error_type = type(e).__name__
         if 'connection' in error_msg or 'network' in error_msg or 'timeout' in error_msg:
             return None, "网络连接失败，请检查网络后重试"
-        elif 'rate' in error_msg or 'limit' in error_msg:
+        elif 'rate' in error_msg or '429' in error_msg or error_type == 'YFRateLimitError':
             return None, "API请求频率限制，请稍后重试"
         else:
             return None, f"获取数据失败: {original_code}"
@@ -331,7 +332,7 @@ def fetch_stock_data(code: str, period: str, days: int, retry: int = 3, demo: bo
                 return df
 
         # 检查是否是限速错误
-        if error and ("限" in error or "limit" in error.lower()):
+        if error and ("rate" in error.lower() or "429" in error):
             wait_time = (attempt + 1) * 10
             print(f"API限速，等待{wait_time}秒后重试... ({attempt + 1}/{retry})")
             time.sleep(wait_time)
