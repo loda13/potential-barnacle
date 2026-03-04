@@ -185,7 +185,8 @@ def safe_fetch_yfinance(code: str, period: str, days: int) -> Tuple[Optional[pd.
         df = ticker.history(period=f"{fetch_days}d", interval=interval)
 
         if df.empty:
-            return None, f"股票代码无效或无数据: {original_code}"
+            # 尝试使用chart API作为备选
+            return safe_fetch_yfinance_chart(code, period, days)
 
         df = df.reset_index()
         df = df.rename(columns={
@@ -208,11 +209,94 @@ def safe_fetch_yfinance(code: str, period: str, days: int) -> Tuple[Optional[pd.
         error_msg = str(e).lower()
         error_type = type(e).__name__
         if 'connection' in error_msg or 'network' in error_msg or 'timeout' in error_msg:
-            return None, "网络连接失败，请检查网络后重试"
+            # 网络错误，尝试chart API
+            return safe_fetch_yfinance_chart(code, period, days)
         elif 'rate' in error_msg or '429' in error_msg or error_type == 'YFRateLimitError':
-            return None, "API请求频率限制，请稍后重试"
+            # 限速错误，尝试chart API作为备选
+            return safe_fetch_yfinance_chart(code, period, days)
         else:
-            return None, f"获取数据失败: {original_code}"
+            # 其他错误，尝试chart API
+            return safe_fetch_yfinance_chart(code, period, days)
+
+
+def safe_fetch_yfinance_chart(code: str, period: str, days: int) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    """使用Yahoo图表API获取数据（备选方案）
+
+    当history API被限速时使用此方法
+    """
+    try:
+        import requests
+    except ImportError:
+        return None, "请安装requests库"
+
+    try:
+        # 转换代码
+        yf_code = code
+        if code.isdigit() and len(code) == 6:
+            if code.startswith(('6', '5', '9')):
+                yf_code = f"{code}.SS"
+            else:
+                yf_code = f"{code}.SZ"
+
+        # 映射周期
+        interval = '1d' if period == 'd' else '1wk'
+
+        # 使用chart API
+        import time
+        end_time = int(time.time())
+        start_time = end_time - (days + 30) * 86400  # 多获取一些
+
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_code}"
+        params = {
+            'period1': start_time,
+            'period2': end_time,
+            'interval': interval,
+            'events': 'history'
+        }
+        headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'}
+
+        response = requests.get(url, params=params, headers=headers, timeout=30)
+
+        if response.status_code != 200:
+            return None, f"API请求失败: HTTP {response.status_code}"
+
+        data = response.json()
+
+        if 'chart' not in data or 'result' not in data['chart'] or data['chart']['result'] is None:
+            return None, f"股票代码无效或无数据: {code}"
+
+        result = data['chart']['result'][0]
+
+        if 'timestamp' not in result:
+            return None, f"无时间戳数据: {code}"
+
+        timestamps = result['timestamp']
+        quote = result['indicators']['quote'][0]
+
+        # 构建DataFrame
+        df = pd.DataFrame({
+            'date': pd.to_datetime(timestamps, unit='s'),
+            'open': quote['open'],
+            'high': quote['high'],
+            'low': quote['low'],
+            'close': quote['close'],
+            'volume': quote['volume']
+        })
+
+        # 清理数据
+        df = df.dropna()
+        df = df[df['close'].notna() & (df['close'] > 0)]
+
+        if df.empty:
+            return None, f"无有效数据: {code}"
+
+        # 取最近N条
+        df = df.tail(days).reset_index(drop=True)
+
+        return df, None
+
+    except Exception as e:
+        return None, f"获取数据失败: {code} - {type(e).__name__}"
 
 
 def safe_fetch_akshare(code: str, period: str, days: int) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
