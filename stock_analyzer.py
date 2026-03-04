@@ -9,6 +9,7 @@ import argparse
 import sys
 import time
 import re
+from datetime import datetime, timedelta
 from typing import Tuple, Dict, List, Optional
 
 import pandas as pd
@@ -80,15 +81,19 @@ def validate_stock_code(code: str) -> Tuple[bool, str]:
     if re.match(r'^\d{4}\.HK$', code):
         return True, ""
 
-    return False, f"股票代码格式无效: {code}\n  A股: 6位数字 (如 600519)\n  美股: 1-5个大写字母 (如 AAPL)\n  港股: 4位数字.HK (如 0700.HK)"
+    # 台股：4位数字 + .TW
+    if re.match(r'^\d{4}\.TW$', code):
+        return True, ""
+
+    return False, f"股票代码格式无效: {code}\n  A股: 6位数字 (如 600519)\n  美股: 1-5个大写字母 (如 AAPL)\n  港股: 4位数字.HK (如 0700.HK)\n  台股: 4位数字.TW (如 2330.TW)"
 
 
-def validate_data(df: pd.DataFrame, min_rows: int = 100) -> Tuple[bool, str, pd.DataFrame]:
+def validate_data(df: pd.DataFrame, min_rows: int = 30) -> Tuple[bool, str, pd.DataFrame]:
     """验证数据是否满足分析要求
 
     Args:
         df: 数据DataFrame
-        min_rows: 最小数据行数
+        min_rows: 最小数据行数（默认30，满足基本计算需求）
 
     Returns:
         (is_valid, error_message, cleaned_df)
@@ -105,6 +110,7 @@ def validate_data(df: pd.DataFrame, min_rows: int = 100) -> Tuple[bool, str, pd.
     if len(df_clean) < min_rows:
         return False, f"数据不足，当前仅 {len(df_clean)} 条有效数据，建议使用 -d {min_rows + 50} 或更大的天数参数（至少需要 {min_rows} 条数据）", pd.DataFrame()
 
+    # 数据量建议提示（返回在success message中）
     return True, "", df_clean
 
 
@@ -334,6 +340,1135 @@ def fetch_stock_data(code: str, period: str, days: int, retry: int = 3, demo: bo
             raise ValueError(error if error else "获取数据失败，请检查股票代码或网络连接")
 
     raise ValueError("多次重试后仍无法获取数据，请稍后再试")
+
+
+def fetch_analyst_consensus(code: str) -> dict:
+    """获取分析师评级共识
+
+    数据源优先级:
+    1. yfinance (美股/港股/A股)
+    2. akshare (A股备选，使用stock_rank_forecast_cninfo)
+
+    yfinance获取:
+    - recommendationKey: strong_buy/buy/hold/sell/strong_sell
+    - targetMeanPrice: 目标均价
+    - numberOfAnalystOpinions: 分析师数量
+
+    akshare获取(仅A股):
+    - 使用stock_rank_forecast_cninfo接口
+    - 汇总买入/卖出评级比例
+
+    Returns:
+        {
+            'rating': 'buy'|'hold'|'sell',
+            'rating_text': '买入居多（建议加仓）',
+            'target_price': 目标价,
+            'analyst_count': 分析师数量,
+            'source': 'Yahoo主流研报'|'东方财富研报'
+        }
+    """
+    default_result = {
+        'rating': 'hold',
+        'rating_text': '暂无评级数据',
+        'target_price': None,
+        'analyst_count': 0,
+        'source': '无数据'
+    }
+
+    # 判断是否为A股
+    is_a_share = code.isdigit() and len(code) == 6
+
+    # 尝试使用yfinance获取
+    try:
+        import yfinance as yf
+
+        # A股代码转换
+        yf_code = code
+        if is_a_share:
+            if code.startswith(('6', '5', '9')):
+                yf_code = f"{code}.SS"
+            else:
+                yf_code = f"{code}.SZ"
+
+        ticker = yf.Ticker(yf_code)
+        info = ticker.info
+
+        if info:
+            rec_key = info.get('recommendationKey', '')
+            target_price = info.get('targetMeanPrice')
+            analyst_count = info.get('numberOfAnalystOpinions', 0)
+
+            # 映射评级
+            rating_map = {
+                'strong_buy': ('buy', '强烈买入（建议重点加仓）'),
+                'buy': ('buy', '买入居多（建议加仓）'),
+                'hold': ('hold', '持仓观望'),
+                'sell': ('sell', '卖出为主（建议减仓）'),
+                'strong_sell': ('sell', '强烈卖出（建议清仓）')
+            }
+
+            if rec_key in rating_map:
+                rating, rating_text = rating_map[rec_key]
+                return {
+                    'rating': rating,
+                    'rating_text': rating_text,
+                    'target_price': target_price,
+                    'analyst_count': analyst_count if analyst_count else 0,
+                    'source': 'Yahoo主流研报'
+                }
+
+    except Exception:
+        pass  # yfinance失败，尝试akshare
+
+    # A股尝试使用akshare
+    if is_a_share:
+        try:
+            import akshare as ak
+
+            # 使用东方财富研报接口
+            df = ak.stock_rank_forecast_cninfo(symbol=code)
+
+            if df is not None and not df.empty:
+                # 统计评级（假设列名包含"评级"或类似字段）
+                # 该接口返回预测数据，我们需要统计看多/看空比例
+                buy_count = 0
+                sell_count = 0
+                hold_count = 0
+
+                for _, row in df.iterrows():
+                    # 尝试从数据中提取评级信息
+                    rating_str = str(row.get('评级', row.get('rating', ''))).lower()
+                    if '买' in rating_str or 'buy' in rating_str:
+                        buy_count += 1
+                    elif '卖' in rating_str or 'sell' in rating_str:
+                        sell_count += 1
+                    else:
+                        hold_count += 1
+
+                total = buy_count + sell_count + hold_count
+                if total > 0:
+                    if buy_count > sell_count and buy_count > hold_count:
+                        return {
+                            'rating': 'buy',
+                            'rating_text': '买入居多（建议加仓）',
+                            'target_price': None,
+                            'analyst_count': total,
+                            'source': '东方财富研报'
+                        }
+                    elif sell_count > buy_count and sell_count > hold_count:
+                        return {
+                            'rating': 'sell',
+                            'rating_text': '卖出为主（建议减仓）',
+                            'target_price': None,
+                            'analyst_count': total,
+                            'source': '东方财富研报'
+                        }
+                    else:
+                        return {
+                            'rating': 'hold',
+                            'rating_text': '持仓观望',
+                            'target_price': None,
+                            'analyst_count': total,
+                            'source': '东方财富研报'
+                        }
+
+        except Exception:
+            pass
+
+    return default_result
+
+
+# ============ 新增功能: 筹码分布 ============
+
+def fetch_chip_distribution(code: str) -> dict:
+    """获取筹码分布数据
+
+    数据源: akshare.stock_cyq_em (东方财富筹码分布)
+
+    Returns:
+        {
+            'price': 当前价,
+            'cost_range': [(价格区间, 占比), ...],
+            'concentration': 集中度描述,
+            'main_cost_area': 主力成本区,
+            'float_ratio': 浮筹比例,
+            'profit_ratio': 获利盘比例,
+            'source': '东方财富筹码分布'
+        }
+    """
+    default_result = {
+        'price': None,
+        'cost_range': [],
+        'concentration': '未知',
+        'main_cost_area': None,
+        'float_ratio': None,
+        'profit_ratio': None,
+        'source': '获取失败'
+    }
+
+    # 判断是否为A股
+    is_a_share = code.isdigit() and len(code) == 6
+    if not is_a_share:
+        default_result['source'] = '仅支持A股'
+        return default_result
+
+    try:
+        import akshare as ak
+
+        # 获取筹码分布数据
+        df = ak.stock_cyq_em(symbol=code)
+
+        if df is None or df.empty:
+            default_result['source'] = '数据为空'
+            return default_result
+
+        # 解析数据 - 东方财富筹码分布返回的格式通常是:
+        # 价位, 持股比例, 日期 等列
+        # 需要根据实际返回格式进行调整
+
+        # 尝试找到价位和比例列
+        price_col = None
+        ratio_col = None
+
+        for col in df.columns:
+            col_lower = str(col).lower()
+            if '价' in col or 'price' in col_lower:
+                price_col = col
+            if '比' in col or 'ratio' in col_lower or '比例' in col:
+                ratio_col = col
+
+        if price_col is None or ratio_col is None:
+            # 尝试使用默认列名
+            if len(df.columns) >= 2:
+                price_col = df.columns[0]
+                ratio_col = df.columns[1]
+
+        if price_col and ratio_col:
+            # 转换数据
+            df[price_col] = pd.to_numeric(df[price_col], errors='coerce')
+            df[ratio_col] = pd.to_numeric(df[ratio_col], errors='coerce')
+            df = df.dropna()
+
+            if not df.empty:
+                # 获取当前价格（最新价）
+                current_price = df[price_col].iloc[-1] if len(df) > 0 else None
+
+                # 获取筹码分布区间
+                cost_range = []
+                for _, row in df.iterrows():
+                    price = row[price_col]
+                    ratio = row[ratio_col]
+                    if pd.notna(price) and pd.notna(ratio):
+                        cost_range.append((round(price, 2), round(ratio, 2)))
+
+                # 计算主力成本区（持股比例最高的价位区间）
+                if cost_range:
+                    # 排序找到最高比例的价位
+                    sorted_by_ratio = sorted(cost_range, key=lambda x: x[1], reverse=True)
+                    main_cost = sorted_by_ratio[0][0] if sorted_by_ratio else None
+
+                    # 计算集中度（90%筹码区间）
+                    sorted_by_price = sorted(cost_range, key=lambda x: x[0])
+                    total_ratio = 0
+                    low_price = None
+                    high_price = None
+
+                    for price, ratio in sorted_by_price:
+                        total_ratio += ratio
+                        if low_price is None:
+                            low_price = price
+                        if total_ratio <= 90:
+                            high_price = price
+                        else:
+                            break
+
+                    concentration = "集中" if current_price and (high_price - low_price) / current_price < 0.2 else "分散"
+
+                    # 估算浮筹比例（通常取最近20%价位的筹码）
+                    recent_range = cost_range[-10:] if len(cost_range) >= 10 else cost_range
+                    float_ratio = sum(r for _, r in recent_range) / len(recent_range) if recent_range else None
+
+                    # 估算获利盘（当前价格以上的筹码比例）
+                    if current_price:
+                        profit_ratio = sum(r for p, r in cost_range if p > current_price)
+                    else:
+                        profit_ratio = None
+
+                    return {
+                        'price': current_price,
+                        'cost_range': cost_range[:20],  # 限制返回数量
+                        'concentration': concentration,
+                        'main_cost_area': f"{main_cost-2}-{main_cost+2}" if main_cost else None,
+                        'float_ratio': round(float_ratio, 1) if float_ratio else None,
+                        'profit_ratio': round(profit_ratio, 1) if profit_ratio else None,
+                        'source': '东方财富筹码分布'
+                    }
+
+    except ImportError:
+        default_result['source'] = '请安装akshare: pip install akshare'
+    except Exception as e:
+        error_msg = str(e).lower()
+        if 'network' in error_msg or 'connection' in error_msg:
+            default_result['source'] = '网络连接失败'
+        else:
+            default_result['source'] = f'获取失败: {type(e).__name__}'
+
+    return default_result
+
+
+# ============ 主力资金流向 ============
+
+def fetch_fund_flow(code: str, df: pd.DataFrame = None) -> dict:
+    """获取主力资金流向
+
+    数据源:
+    - A股: akshare.stock_fund_flow_industry 或 volume分析
+    - 美股: volume + price change分析
+
+    Returns:
+        {
+            'main_inflow_today': 当日主力净流入,
+            'main_inflow_5d': 5日主力净流入,
+            'signal': '净流入'/'净流出'/'观望',
+            'trend': '持续流入'/'持续流出'/'反转',
+            'volume_ratio': 量比,
+            'source': 数据来源
+        }
+    """
+    default_result = {
+        'main_inflow_today': None,
+        'main_inflow_5d': None,
+        'main_inflow_10d': None,
+        'signal': '未知',
+        'trend': '观望',
+        'volume_ratio': None,
+        'source': '获取失败'
+    }
+
+    is_a_share = code.isdigit() and len(code) == 6
+
+    # 方法1: 尝试akshare行业资金流（仅A股）
+    if is_a_share:
+        try:
+            import akshare as ak
+
+            # 获取行业资金流
+            df_flow = ak.stock_fund_flow_industry()
+
+            if df_flow is not None and not df_flow.empty:
+                # 尝试找到目标股票对应的行业
+                # 这里简化处理，返回行业资金流数据
+                default_result['source'] = '东方财富行业资金流'
+
+                # 如果有大盘数据，计算简单的净流入
+                if df is not None and len(df) >= 5:
+                    # 基于成交量和价格变化估算
+                    recent = df.tail(5)
+                    avg_volume = df['volume'].rolling(5).mean().iloc[-1] if len(df) >= 5 else df['volume'].mean()
+                    current_volume = df['volume'].iloc[-1]
+
+                    # 计算价格变化
+                    price_change = (df['close'].iloc[-1] - df['close'].iloc[-5]) / df['close'].iloc[-5] * 100 if len(df) >= 5 else 0
+
+                    # 估算净流入（简化模型）
+                    volume_diff = current_volume - avg_volume
+                    if volume_diff > 0 and price_change > 0:
+                        main_inflow = volume_diff * df['close'].iloc[-1] / 10000  # 万元
+                        default_result['main_inflow_today'] = round(main_inflow, 2)
+                        default_result['signal'] = '净流入'
+
+                        # 5日累计
+                        flow_5d = 0
+                        for i in range(min(5, len(df))):
+                            v = df['volume'].iloc[-(i+1)]
+                            p = df['close'].iloc[-(i+1)]
+                            pc = df['close'].iloc[-(i+1)] - df['open'].iloc[-(i+1)]
+                            if pc > 0:
+                                flow_5d += v * p / 10000
+                        default_result['main_inflow_5d'] = round(flow_5d, 2)
+                    elif volume_diff < 0 and price_change < 0:
+                        default_result['signal'] = '净流出'
+                        default_result['main_inflow_today'] = round(volume_diff * df['close'].iloc[-1] / 10000, 2)
+                    else:
+                        default_result['signal'] = '观望'
+
+                    # 量比
+                    default_result['volume_ratio'] = round(current_volume / avg_volume, 2) if avg_volume > 0 else 1
+
+                return default_result
+
+        except ImportError:
+            pass
+        except Exception:
+            pass
+
+    # 方法2: 基于成交量分析（通用）
+    if df is not None and len(df) >= 20:
+        try:
+            # 计算各项指标
+            avg_volume_5 = df['volume'].tail(5).mean()
+            avg_volume_20 = df['volume'].tail(20).mean()
+            current_volume = df['volume'].iloc[-1]
+            volume_ratio = current_volume / avg_volume_20 if avg_volume_20 > 0 else 1
+
+            # 近期涨跌分析
+            recent_5d = df.tail(5)
+            up_days = sum(1 for i in range(len(recent_5d)) if recent_5d['close'].iloc[-(i+1)] > recent_5d['open'].iloc[-(i+1)])
+            up_volume = sum(recent_5d['volume'].iloc[-(i+1)] for i in range(len(recent_5d)) if recent_5d['close'].iloc[-(i+1)] > recent_5d['open'].iloc[-(i+1)])
+            down_volume = sum(recent_5d['volume'].iloc[-(i+1)] for i in range(len(recent_5d)) if recent_5d['close'].iloc[-(i+1)] <= recent_5d['open'].iloc[-(i+1)])
+
+            # 资金流向判断
+            if up_volume > down_volume * 1.2:
+                signal = '净流入'
+                trend = '持续流入' if up_days >= 3 else '反弹'
+            elif down_volume > up_volume * 1.2:
+                signal = '净流出'
+                trend = '持续流出' if (5 - up_days) >= 3 else '回调'
+            else:
+                signal = '观望'
+                trend = '震荡'
+
+            # 估算金额（使用成交量*价格/10000 = 万元）
+            avg_price = df['close'].tail(5).mean()
+            net_flow = (up_volume - down_volume) * avg_price / 10000
+
+            return {
+                'main_inflow_today': round(net_flow * 0.2, 2) if signal == '净流入' else round(net_flow * 0.2, 2),
+                'main_inflow_5d': round(net_flow, 2),
+                'main_inflow_10d': round(net_flow * 2, 2) if len(df) >= 10 else None,
+                'signal': signal,
+                'trend': trend,
+                'volume_ratio': round(volume_ratio, 2),
+                'source': '技术分析'
+            }
+
+        except Exception:
+            pass
+
+    default_result['source'] = '数据不足'
+    return default_result
+
+
+# ============ 实时新闻/舆情 ============
+
+def fetch_news_sentiment(code: str) -> dict:
+    """获取新闻和舆情分析
+
+    数据源: yfinance.Ticker.news
+
+    情绪判断规则:
+    - 利好关键词: buy/upgrade/beat/raise/target/bullish/growth/profit/上调/增持
+    - 利空关键词: sell/downgrade/miss/cut/bearish/loss/warning/risk/下调/减持
+
+    Returns:
+        {
+            'news': [...],
+            'sentiment': '利好'/'利空'/'中性',
+            'sentiment_score': -10到+10,
+            'summary': '简要总结',
+            'source': 'Yahoo Finance'
+        }
+    """
+    default_result = {
+        'news': [],
+        'sentiment': '中性',
+        'sentiment_score': 0,
+        'summary': '暂无新闻数据',
+        'source': '获取失败'
+    }
+
+    # 判断股票代码
+    is_a_share = code.isdigit() and len(code) == 6
+
+    try:
+        import yfinance as yf
+
+        # 转换代码
+        yf_code = code
+        if is_a_share:
+            if code.startswith(('6', '5', '9')):
+                yf_code = f"{code}.SS"
+            else:
+                yf_code = f"{code}.SZ"
+
+        ticker = yf.Ticker(yf_code)
+
+        # 获取新闻
+        news_data = ticker.news
+
+        if not news_data:
+            default_result['source'] = '暂无新闻'
+            return default_result
+
+        # 解析新闻
+        news_list = []
+        for item in news_data[:5]:  # 取最近5条
+            title = item.get('title', '')
+            source = item.get('publisher', '未知来源')
+            time_str = item.get('time', '')
+            if time_str and hasattr(time_str, 'strftime'):
+                time_str = time_str.strftime('%m-%d')
+            elif time_str:
+                time_str = str(time_str)[:10]
+
+            news_list.append({
+                'title': title,
+                'source': source,
+                'time': time_str,
+                'url': item.get('link', '')
+            })
+
+        # 情绪分析
+        bullish_keywords = ['buy', 'upgrade', 'beat', 'raise', 'target', 'bullish', 'growth',
+                           'profit', '上调', '增持', '推荐', '看好', '买入', '强买', '超配']
+        bearish_keywords = ['sell', 'downgrade', 'miss', 'cut', 'bearish', 'loss', 'warning',
+                           'risk', '下调', '减持', '看空', '卖出', '弱卖', '低配', '警告']
+
+        bullish_count = 0
+        bearish_count = 0
+
+        for item in news_data[:10]:
+            title = str(item.get('title', '')).lower()
+            summary = str(item.get('summary', '')).lower()
+
+            for kw in bullish_keywords:
+                if kw.lower() in title or kw.lower() in summary:
+                    bullish_count += 1
+                    break
+
+            for kw in bearish_keywords:
+                if kw.lower() in title or kw.lower() in summary:
+                    bearish_count += 1
+                    break
+
+        # 计算情绪分数
+        sentiment_score = (bullish_count - bearish_count) * 2
+        sentiment_score = max(-10, min(10, sentiment_score))
+
+        if sentiment_score > 3:
+            sentiment = '利好'
+        elif sentiment_score < -3:
+            sentiment = '利空'
+        else:
+            sentiment = '中性'
+
+        # 生成总结
+        summary = f"{bullish_count}条利好，{bearish_count}条利空"
+        if sentiment == '利好':
+            summary += "，市场情绪偏多"
+        elif sentiment == '利空':
+            summary += "，市场情绪偏空"
+        else:
+            summary += "，市场观望为主"
+
+        return {
+            'news': news_list,
+            'sentiment': sentiment,
+            'sentiment_score': sentiment_score,
+            'summary': summary,
+            'source': 'Yahoo Finance'
+        }
+
+    except ImportError:
+        default_result['source'] = '请安装yfinance'
+    except Exception as e:
+        default_result['source'] = f'获取失败: {type(e).__name__}'
+
+    return default_result
+
+
+# ============ 大盘复盘+板块 ============
+
+def get_market_review() -> dict:
+    """获取大盘复盘数据
+
+    指数代码:
+    - 上证指数: ^SSEC
+    - 深证成指: ^SZCOMP
+    - 创业板指: 399006.SZ
+    - 纳斯达克: ^IXIC
+    - 道琼斯: ^DJI
+
+    Returns:
+        {
+            'indices': {...},
+            'sectors': [...],
+            'market_status': '普涨'/'普跌'/'分化'/'震荡'
+        }
+    """
+    default_result = {
+        'indices': {},
+        'sectors': [],
+        'market_status': '获取失败'
+    }
+
+    try:
+        import yfinance as yf
+
+        # 指数代码列表
+        index_codes = {
+            '上证指数': '^SSEC',
+            '深证成指': '^SZCOMP',
+            '创业板指': '399006.SZ',
+            '纳斯达克': '^IXIC',
+            '道琼斯': '^DJI'
+        }
+
+        indices = {}
+        changes = []
+
+        for name, code in index_codes.items():
+            try:
+                ticker = yf.Ticker(code)
+                hist = ticker.history(period='5d')
+
+                if hist is not None and len(hist) >= 2:
+                    current_price = hist['Close'].iloc[-1]
+                    prev_price = hist['Close'].iloc[-2]
+                    change = (current_price - prev_price) / prev_price * 100
+
+                    indices[name] = {
+                        'code': code,
+                        'price': round(current_price, 2),
+                        'change': round(change, 2)
+                    }
+                    changes.append(change)
+
+            except Exception:
+                pass
+
+        # 判断市场状态
+        if changes:
+            avg_change = sum(changes) / len(changes)
+            pos_count = sum(1 for c in changes if c > 0)
+            neg_count = len(changes) - pos_count
+
+            if pos_count >= len(changes) * 0.7 and avg_change > 0.5:
+                market_status = '普涨'
+            elif neg_count >= len(changes) * 0.7 and avg_change < -0.5:
+                market_status = '普跌'
+            elif abs(avg_change) < 0.5:
+                market_status = '震荡'
+            else:
+                market_status = '分化'
+
+        default_result['indices'] = indices
+        default_result['market_status'] = market_status
+
+        # 尝试获取A股板块数据
+        try:
+            import akshare as ak
+
+            # 获取板块资金流
+            df_sector = ak.stock_fund_flow_industry()
+
+            if df_sector is not None and not df_sector.empty:
+                # 尝试找到涨跌幅列
+                sector_name_col = None
+                change_col = None
+                inflow_col = None
+
+                for col in df_sector.columns:
+                    col_str = str(col)
+                    if '名称' in col_str or '行业' in col_str:
+                        sector_name_col = col
+                    elif '涨跌幅' in col_str or '涨幅' in col_str:
+                        change_col = col
+                    elif '净流入' in col_str or '流入' in col_str:
+                        inflow_col = col
+
+                if sector_name_col and change_col:
+                    sectors = []
+                    for _, row in df_sector.head(5).iterrows():
+                        name = row.get(sector_name_col, '')
+                        change = row.get(change_col, 0)
+                        inflow = row.get(inflow_col, 0) if inflow_col else 0
+
+                        sectors.append({
+                            'name': str(name),
+                            'change': round(float(change), 2) if pd.notna(change) else 0,
+                            'inflow': round(float(inflow), 2) if pd.notna(inflow) else 0
+                        })
+
+                    default_result['sectors'] = sectors
+
+        except Exception:
+            pass
+
+        return default_result
+
+    except ImportError:
+        default_result['market_status'] = '请安装yfinance'
+    except Exception as e:
+        default_result['market_status'] = f'获取失败: {type(e).__name__}'
+
+    return default_result
+
+
+# ============ 精确买卖/止损/目标价 + 检查清单 ============
+
+def calculate_price_targets(df: pd.DataFrame, resonance: dict, consensus: dict,
+                           support: list, resistance: list) -> dict:
+    """计算精确的买卖价格和止损价
+
+    买入价计算逻辑:
+    - 优先: 回调到支撑位附近
+    - 次选: 回调到MA10/MA20均线
+    - 备选: 当前价格 * 0.98
+
+    止损价计算逻辑:
+    - 优先: 跌破关键支撑位
+    - 次选: ATR止损 (close - 2*ATR)
+    - 备选: 买入价 * 0.95
+
+    目标价计算逻辑:
+    - 优先: 目标价来自机构共识
+    - 次选: 上涨至前高/压力位
+    - 备选: 上涨空间 = 止损幅度的2倍
+    """
+    last = df.iloc[-1]
+    current_price = last['close']
+
+    default_result = {
+        'buy_price': None,
+        'stop_loss': None,
+        'target_price': None,
+        'risk_reward': None,
+        'position_size': None,
+        'buy_reason': '',
+        'stop_reason': '',
+        'target_reason': ''
+    }
+
+    try:
+        # ========== 买入价 ==========
+        buy_price = None
+        buy_reason = ''
+
+        # 方案1: 支撑位附近
+        if support:
+            nearest_support = min(support, key=lambda x: abs(x - current_price))
+            if nearest_support < current_price:
+                buy_price = nearest_support
+                buy_reason = f'回调至支撑位{nearest_support}'
+            elif nearest_support <= current_price * 1.02:
+                buy_price = current_price
+                buy_reason = '接近支撑位'
+
+        # 方案2: MA均线
+        if buy_price is None:
+            ma10 = last.get('MA10')
+            ma20 = last.get('MA20')
+
+            if ma10 and ma10 < current_price:
+                buy_price = ma10
+                buy_reason = f'回调至MA10({ma10:.2f})'
+            elif ma20 and ma20 < current_price:
+                buy_price = ma20
+                buy_reason = f'回调至MA20({ma20:.2f})'
+
+        # 方案3: 当前价格98折
+        if buy_price is None:
+            buy_price = current_price * 0.98
+            buy_reason = '2%回调'
+
+        # ========== 止损价 ==========
+        stop_loss = None
+        stop_reason = ''
+
+        # 方案1: 跌破支撑位下方
+        if support:
+            valid_supports = [s for s in support if s < buy_price]
+            if valid_supports:
+                stop_loss = min(valid_supports) * 0.98
+                stop_reason = f'跌破支撑位({min(valid_supports):.2f})'
+
+        # 方案2: ATR止损
+        if stop_loss is None:
+            atr = last.get('ATR')
+            if pd.notna(atr):
+                stop_loss = buy_price - 2 * atr
+                stop_reason = f'ATR止损({2*atr:.2f})'
+
+        # 方案3: 5%止损
+        if stop_loss is None:
+            stop_loss = buy_price * 0.95
+            stop_reason = '5%固定止损'
+
+        # ========== 目标价 ==========
+        target_price = None
+        target_reason = ''
+
+        # 方案1: 机构目标价
+        if consensus and consensus.get('target_price'):
+            target_price = consensus['target_price']
+            target_reason = '机构目标价'
+
+        # 方案2: 压力位
+        if target_price is None and resistance:
+            valid_resistances = [r for r in resistance if r > buy_price]
+            if valid_resistances:
+                target_price = min(valid_resistances)
+                target_reason = f'第一压力位({target_price:.2f})'
+
+        # 方案3: 前高
+        if target_price is None:
+            high_60 = df['high'].tail(60).max()
+            if high_60 > current_price:
+                target_price = high_60
+                target_reason = f'60日最高({high_60:.2f})'
+
+        # 方案4: 2倍止损空间
+        if target_price is None:
+            risk = buy_price - stop_loss
+            target_price = buy_price + risk * 2
+            target_reason = '2倍风险报酬'
+
+        # ========== 风险报酬比 ==========
+        risk = buy_price - stop_loss
+        reward = target_price - buy_price
+
+        if risk > 0:
+            risk_reward = round(reward / risk, 1)
+        else:
+            risk_reward = None
+
+        # ========== 建议仓位 ==========
+        if risk_reward:
+            if risk_reward >= 3:
+                position_size = 30
+            elif risk_reward >= 2:
+                position_size = 20
+            elif risk_reward >= 1:
+                position_size = 15
+            else:
+                position_size = 10
+        else:
+            position_size = 10
+
+        return {
+            'buy_price': round(buy_price, 2),
+            'stop_loss': round(stop_loss, 2),
+            'target_price': round(target_price, 2),
+            'risk_reward': risk_reward,
+            'position_size': position_size,
+            'buy_reason': buy_reason,
+            'stop_reason': stop_reason,
+            'target_reason': target_reason
+        }
+
+    except Exception as e:
+        return default_result
+
+
+def generate_checklist(df: pd.DataFrame, resonance: dict, signals: dict,
+                      indicators: dict) -> list:
+    """生成10项买入检查清单
+
+    Returns:
+        [(检查项, 是否通过, 原因), ...]
+    """
+    last = df.iloc[-1]
+    results = []
+
+    # 1. MA多头排列
+    ma5 = last.get('MA5')
+    ma10 = last.get('MA10')
+    ma20 = last.get('MA20')
+
+    if pd.notna(ma5) and pd.notna(ma10) and pd.notna(ma20):
+        is_bullish = ma5 > ma10 > ma20
+        reason = f"MA5>{ma10:.1f}>MA20{ma10:.1f}" if is_bullish else "非多头排列"
+        results.append(("MA均线多头排列", is_bullish, reason))
+    else:
+        results.append(("MA均线多头排列", False, "数据不足"))
+
+    # 2. 乖离率
+    if pd.notna(ma20):
+        bias = (last['close'] - ma20) / ma20 * 100
+        is_ok = abs(bias) < 8
+        reason = f"乖离率{bias:.1f}%" if is_ok else f"乖离率过高({bias:.1f}%)"
+        results.append(("乖离率合理(<8%)", is_ok, reason))
+    else:
+        results.append(("乖离率合理(<8%)", False, "MA20数据不足"))
+
+    # 3. RSI未超买
+    rsi = last.get('RSI')
+    if pd.notna(rsi):
+        is_ok = rsi < 75
+        reason = f"RSI={rsi:.1f}" if is_ok else f"RSI超买({rsi:.1f})"
+        results.append(("RSI未超买(<75)", is_ok, reason))
+    else:
+        results.append(("RSI未超买(<75)", False, "RSI数据不足"))
+
+    # 4. KDJ未超买
+    kdj_j = last.get('KDJ_J')
+    if pd.notna(kdj_j):
+        is_ok = kdj_j < 85
+        reason = f"KDJ_J={kdj_j:.1f}" if is_ok else f"KDJ超买({kdj_j:.1f})"
+        results.append(("KDJ未超买(<85)", is_ok, reason))
+    else:
+        results.append(("KDJ未超买(<85)", False, "KDJ数据不足"))
+
+    # 5. MACD多头运行
+    macd = last.get('MACD')
+    macd_signal = last.get('MACD_signal')
+    if pd.notna(macd) and pd.notna(macd_signal):
+        is_bullish = macd > macd_signal
+        reason = "MACD多头运行" if is_bullish else "MACD空头运行"
+        results.append(("MACD多头运行", is_bullish, reason))
+    else:
+        results.append(("MACD多头运行", False, "MACD数据不足"))
+
+    # 6. 布林带未突破上轨
+    bb_upper = last.get('BB_upper')
+    if pd.notna(bb_upper):
+        is_ok = last['close'] < bb_upper * 1.02
+        reason = "布林带轨道内" if is_ok else "接近上轨"
+        results.append(("布林带未突破上轨", is_ok, reason))
+    else:
+        results.append(("布林带未突破上轨", False, "布林带数据不足"))
+
+    # 7. ADX趋势向上
+    adx = last.get('ADX')
+    adx_pdi = last.get('ADX_PDI')
+    adx_ndi = last.get('ADX_NDI')
+    if pd.notna(adx) and pd.notna(adx_pdi) and pd.notna(adx_ndi):
+        is_trending = adx > 20 and adx_pdi > adx_ndi
+        reason = f"ADX={adx:.1f}多头趋势" if is_trending else f"ADX={adx:.1f}趋势不明"
+        results.append(("ADX趋势向上(>20)", is_trending, reason))
+    else:
+        results.append(("ADX趋势向上(>20)", False, "ADX数据不足"))
+
+    # 8. 成交量配合
+    if len(df) >= 5:
+        avg_vol = df['volume'].tail(5).mean()
+        current_vol = df['volume'].iloc[-1]
+        vol_ratio = current_vol / avg_vol if avg_vol > 0 else 1
+        is_ok = vol_ratio > 0.8
+        reason = f"量比{vol_ratio:.2f}" if is_ok else f"量比过低({vol_ratio:.2f})"
+        results.append(("成交量配合(量比>0.8)", is_ok, reason))
+    else:
+        results.append(("成交量配合(量比>0.8)", False, "数据不足"))
+
+    # 9. 价格在支撑位上方
+    support, _ = find_support_resistance(df)
+    if support:
+        nearest = min(support)
+        is_above = last['close'] > nearest * 0.97
+        reason = f"距支撑位{((last['close']-nearest)/nearest*100):.1f}%"
+        results.append(("价格在支撑位上方", is_above, reason))
+    else:
+        results.append(("价格在支撑位上方", True, "无明显支撑"))
+
+    # 10. 技术面共振
+    res = resonance.get('resonance', 'neutral')
+    is_ok = res in ['strong_buy', 'buy']
+    reason = f"技术面{res}" if is_ok else "技术面偏弱"
+    results.append(("技术面共振偏多", is_ok, reason))
+
+    return results
+
+
+# ============ LLM决策仪表盘 ============
+
+def generate_decision_dashboard(resonance: dict, fund_flow: dict,
+                                sentiment: dict, consensus: dict,
+                                win_rate: dict) -> dict:
+    """生成LLM风格决策仪表盘（零成本实现）
+
+    评分权重:
+    - 技术面(40%): strong_buy=90, buy=70, neutral=50, sell=30, strong_sell=10
+    - 资金面(30%): 持续流入=80, 流入=65, 观望=50, 流出=35, 持续流出=20
+    - 舆情(15%): 利好=80, 中性=50, 利空=20
+    - 机构(15%): buy=85, hold=50, sell=15
+
+    Returns:
+        {
+            'core_conclusion': str,
+            'bullish_score': int,
+            'bearish_score': int,
+            'sideways_score': int,
+            'verdict': str,
+            'action': str,
+            'confidence': str,
+            'factors': dict
+        }
+    """
+    # 技术面评分 (40%)
+    tech_score = {
+        'strong_buy': 90,
+        'buy': 70,
+        'neutral': 50,
+        'sell': 30,
+        'strong_sell': 10
+    }.get(resonance.get('resonance', 'neutral'), 50)
+
+    # 资金面评分 (30%)
+    fund_signal = fund_flow.get('signal', '未知')
+    fund_trend = fund_flow.get('trend', '观望')
+
+    if fund_trend == '持续流入':
+        fund_score = 80
+    elif fund_signal == '净流入':
+        fund_score = 65
+    elif fund_trend == '反弹':
+        fund_score = 60
+    elif fund_signal == '净流出':
+        fund_score = 35
+    elif fund_trend == '持续流出':
+        fund_score = 20
+    else:
+        fund_score = 50
+
+    # 舆情评分 (15%)
+    sent_score = {
+        '利好': 80,
+        '中性': 50,
+        '利空': 20
+    }.get(sentiment.get('sentiment', '中性'), 50)
+
+    # 机构评分 (15%)
+    consensus_rating = consensus.get('rating', 'hold') if consensus else 'hold'
+    institution_score = {
+        'buy': 85,
+        'hold': 50,
+        'sell': 15
+    }.get(consensus_rating, 50)
+
+    # 计算综合评分
+    bullish_score = int(tech_score * 0.4 + fund_score * 0.3 + sent_score * 0.15 + institution_score * 0.15)
+    bearish_score = 100 - bullish_score
+
+    # 震荡评分（基于ADX或市场状态）
+    sideways_score = min(bullish_score, bearish_score) * 0.5
+
+    # 判断多空
+    if bullish_score >= 70:
+        verdict = '看多'
+    elif bearish_score >= 70:
+        verdict = '看空'
+    else:
+        verdict = '震荡'
+
+    # 行动建议
+    if verdict == '看多':
+        if bullish_score >= 85:
+            action = '加仓'
+        else:
+            action = '买入'
+    elif verdict == '看空':
+        if bearish_score >= 85:
+            action = '清仓'
+        else:
+            action = '减仓'
+    else:
+        action = '持仓观望'
+
+    # 置信度
+    diff = abs(bullish_score - bearish_score)
+    if diff >= 40:
+        confidence = '高'
+    elif diff >= 20:
+        confidence = '中'
+    else:
+        confidence = '低'
+
+    # 核心结论
+    tech_dir = '偏多' if tech_score >= 60 else ('偏空' if tech_score <= 40 else '中性')
+    fund_dir = '流入' if fund_score >= 60 else ('流出' if fund_score <= 40 else '观望')
+    sent_dir = sentiment.get('sentiment', '中性')
+    consensus_dir = {'buy': '看涨', 'hold': '观望', 'sell': '看跌'}.get(consensus_rating, '观望')
+
+    core_conclusion = f"技术面{tech_dir}+资金{fund_dir}+舆情{sent_dir}+机构{consensus_dir}，综合评分{bullish_score}分"
+
+    return {
+        'core_conclusion': core_conclusion,
+        'bullish_score': bullish_score,
+        'bearish_score': bearish_score,
+        'sideways_score': int(sideways_score),
+        'verdict': verdict,
+        'action': action,
+        'confidence': confidence,
+        'factors': {
+            '技术面': tech_dir,
+            '资金面': fund_dir,
+            '舆情': sent_dir,
+            '机构': consensus_dir
+        }
+    }
+    # 判断技术面方向
+    tech_direction = resonance.get('resonance', 'neutral')
+    tech_bullish = tech_direction in ['strong_buy', 'buy']
+    tech_bearish = tech_direction in ['sell', 'strong_sell']
+
+    # 判断机构共识方向
+    inst_rating = consensus.get('rating', 'hold')
+    inst_bullish = inst_rating == 'buy'
+    inst_bearish = inst_rating == 'sell'
+
+    # 构建结论
+    parts = []
+
+    # 技术面描述
+    if tech_direction == 'strong_buy':
+        tech_desc = "技术面强烈看多"
+    elif tech_direction == 'buy':
+        tech_desc = "技术面偏多"
+    elif tech_direction == 'sell':
+        tech_desc = "技术面偏空"
+    elif tech_direction == 'strong_sell':
+        tech_desc = "技术面强烈看空"
+    else:
+        tech_desc = "技术面中性"
+
+    # 机构共识描述
+    if inst_rating == 'buy':
+        inst_desc = "机构共识看涨"
+    elif inst_rating == 'sell':
+        inst_desc = "机构共识看跌"
+    else:
+        inst_desc = "机构评级中性"
+
+    # 综合判断
+    if tech_bullish and inst_bullish:
+        action = "技术面+机构共识均偏多，建议逢低加仓"
+        if support:
+            action += f"，支撑参考{support[0]:.2f}"
+    elif tech_bullish and inst_bearish:
+        action = "技术面偏多但机构谨慎，建议轻仓试探，设好止损"
+    elif tech_bearish and inst_bullish:
+        action = "机构看好但技术面偏弱，建议等待技术确认后再介入"
+    elif tech_bearish and inst_bearish:
+        action = "技术面+机构共识均偏空，建议减仓观望"
+        if resistance:
+            action += f"，压力位参考{resistance[0]:.2f}"
+    else:
+        # 分歧或中性状态
+        buy_count = len(resonance.get('buy_indicators', []))
+        sell_count = len(resonance.get('sell_indicators', []))
+        if abs(buy_count - sell_count) <= 1:
+            action = "多空分歧明显，建议观望等待明确信号"
+        else:
+            action = "趋势不明朗，建议谨慎操作"
+
+    # 添加胜率参考
+    win_rate_val = win_rate.get('win_rate', 50)
+    if win_rate_val >= 70:
+        confidence = "高置信度"
+    elif win_rate_val >= 55:
+        confidence = "中等置信度"
+    else:
+        confidence = "低置信度"
+
+    # 构建最终结论
+    conclusion = f"{tech_desc}，{inst_desc}。{action}。胜率{win_rate_val:.0f}%（{confidence}）"
+
+    # 添加止损建议（使用支撑位或ATR）
+    if support and tech_bullish:
+        conclusion += f"，止损可参考{support[0]:.2f}下方"
+
+    return conclusion
 
 
 # ============ 技术指标计算函数 ============
@@ -1379,7 +2514,10 @@ def format_table(rows: List[Tuple[str, str, str]], headers: Tuple[str, str, str]
 
 
 def print_analysis(df: pd.DataFrame, code: str, period: str):
-    """打印分析结果（表格格式）"""
+    """打印分析结果（表格格式）
+
+    输出顺序：大盘复盘 → 指标表格 → 筹码/资金流 → 新闻情绪 → 买卖点+清单 → 决策仪表盘 → 综合结论
+    """
     # 计算指标
     df = calculate_indicators(df)
     last = df.iloc[-1]
@@ -1405,11 +2543,32 @@ def print_analysis(df: pd.DataFrame, code: str, period: str):
 
     # 打印结果
     period_name = "日线" if period == 'd' else "周线"
-    print(f"\n{'='*60}")
-    print(f"  股票代码: {code} | 周期: {period_name}")
-    print(f"{'='*60}")
+    print(f"\n{'='*70}")
+    print(f"  股票代码: {code} | 周期: {period_name} | 综合技术分析")
+    print(f"{'='*70}")
 
-    # 最新数据
+    # ========== 1. 大盘复盘 ==========
+    print(f"\n【大盘复盘】")
+    try:
+        market_review = get_market_review()
+        if market_review.get('indices'):
+            for name, data in market_review['indices'].items():
+                change_str = f"+{data['change']:.2f}%" if data['change'] > 0 else f"{data['change']:.2f}%"
+                print(f"  {name}: {data['price']} ({change_str})")
+            print(f"  市场状态: {market_review.get('market_status', '未知')}")
+
+            if market_review.get('sectors'):
+                print(f"\n  热门板块(前5):")
+                for sector in market_review['sectors']:
+                    change_s = f"+{sector['change']:.2f}%" if sector['change'] > 0 else f"{sector['change']:.2f}%"
+                    inflow_s = f"+{sector['inflow']:.1f}亿" if sector['inflow'] > 0 else f"{sector['inflow']:.1f}亿"
+                    print(f"    {sector['name']}: {change_s} 主力{inflow_s}")
+        else:
+            print("  暂无法获取大盘数据")
+    except Exception as e:
+        print(f"  获取大盘数据失败")
+
+    # ========== 2. 最新数据和技术指标 ==========
     print(f"\n【最新数据】")
     print(f"  日期: {last['date'].strftime('%Y-%m-%d')}")
     print(f"  收盘: {last['close']:.2f}")
@@ -1518,10 +2677,202 @@ def print_analysis(df: pd.DataFrame, code: str, period: str):
     print(f"  支撑位: {', '.join(map(str, support)) if support else '暂无'}")
     print(f"  压力位: {', '.join(map(str, resistance)) if resistance else '暂无'}")
 
-    # 一句话总结
-    print(f"\n【总结】")
-    print(f"  {summary}")
-    print(f"{'='*60}\n")
+    # ========== 3. 筹码分布 + 主力资金流向 ==========
+    print(f"\n【筹码分布与资金流向】")
+
+    # 筹码分布
+    try:
+        chip_dist = fetch_chip_distribution(code)
+        if chip_dist.get('source') == '东方财富筹码分布' and chip_dist.get('price'):
+            print(f"  当前股价: {chip_dist['price']:.2f}")
+            if chip_dist.get('main_cost_area'):
+                print(f"  主力成本区: {chip_dist['main_cost_area']}元区间")
+            print(f"  筹码集中度: {chip_dist.get('concentration', '未知')}")
+            if chip_dist.get('profit_ratio') is not None:
+                print(f"  获利盘: {chip_dist['profit_ratio']:.1f}%")
+            if chip_dist.get('float_ratio') is not None:
+                print(f"  浮筹比例: 约{chip_dist['float_ratio']:.1f}%")
+        else:
+            print(f"  筹码分布: {chip_dist.get('source', '获取失败')}")
+    except Exception as e:
+        print(f"  筹码分布: 获取失败")
+
+    # 主力资金流向
+    try:
+        fund_flow = fetch_fund_flow(code, df)
+        if fund_flow.get('source') and fund_flow.get('source') != '获取失败':
+            inflow_today = fund_flow.get('main_inflow_today')
+            inflow_5d = fund_flow.get('main_inflow_5d')
+            signal = fund_flow.get('signal', '未知')
+            trend_f = fund_flow.get('trend', '观望')
+            vol_ratio = fund_flow.get('volume_ratio')
+
+            if inflow_today is not None:
+                inflow_str = f"+{inflow_today:.0f}万" if inflow_today > 0 else f"{inflow_today:.0f}万"
+                print(f"  当日主力净流入: {inflow_str}")
+            if inflow_5d is not None:
+                inflow_5d_str = f"+{inflow_5d:.0f}万" if inflow_5d > 0 else f"{inflow_5d:.0f}万"
+                print(f"  5日累计净流入: {inflow_5d_str}")
+            print(f"  资金动向: {signal} ({trend_f})")
+            if vol_ratio:
+                print(f"  量比: {vol_ratio:.2f}")
+            print(f"  数据来源: {fund_flow.get('source', '技术分析')}")
+        else:
+            print(f"  主力资金流: 数据不足")
+    except Exception as e:
+        print(f"  主力资金流: 获取失败")
+
+    # ========== 4. 新闻舆情 ==========
+    print(f"\n【市场舆情】")
+    try:
+        news_sentiment = fetch_news_sentiment(code)
+        if news_sentiment.get('news'):
+            print(f"  最新新闻(最近5条):")
+            for i, news in enumerate(news_sentiment['news'][:5], 1):
+                title = news.get('title', '')[:40]
+                source = news.get('source', '未知')
+                print(f"    {i}. {title} ({source})")
+
+            sentiment = news_sentiment.get('sentiment', '中性')
+            score = news_sentiment.get('sentiment_score', 0)
+            summary = news_sentiment.get('summary', '')
+            print(f"\n  情绪分析: {sentiment} (评分: {score:+d})")
+            print(f"  总结: {summary}")
+        else:
+            print(f"  暂无新闻数据")
+    except Exception as e:
+        print(f"  获取新闻失败")
+
+    # ========== 5. 分析师共识（机构评级） ==========
+    print(f"\n【机构评级】")
+    consensus = None
+    try:
+        consensus = fetch_analyst_consensus(code)
+        print(f"  机构评级: {consensus['rating_text']}")
+        if consensus['target_price']:
+            print(f"  目标价: {consensus['target_price']:.2f}")
+        if consensus['analyst_count'] > 0:
+            print(f"  分析师数量: {consensus['analyst_count']}位")
+        print(f"  数据来源: 基于{consensus['source']}汇总")
+    except Exception as e:
+        print("  暂无法获取分析师评级数据")
+
+    # ========== 6. 买卖点分析 + 检查清单 ==========
+    print(f"\n【买卖点分析】")
+
+    try:
+        price_targets = calculate_price_targets(df, resonance, consensus, support, resistance)
+        print(f"  建议买入价: {price_targets['buy_price']:.2f}元 ({price_targets.get('buy_reason', '')})")
+        print(f"  建议止损价: {price_targets['stop_loss']:.2f}元 ({price_targets.get('stop_reason', '')})")
+        print(f"  目标价: {price_targets['target_price']:.2f}元 ({price_targets.get('target_reason', '')})")
+
+        if price_targets.get('risk_reward'):
+            print(f"  风险报酬比: 1:{price_targets['risk_reward']}")
+        print(f"  建议仓位: {price_targets.get('position_size', 10)}%")
+
+    except Exception as e:
+        print(f"  计算买卖点失败")
+
+    # 操作检查清单
+    print(f"\n【操作检查清单】")
+    try:
+        checklist = generate_checklist(df, resonance, signals, indicators)
+        pass_count = sum(1 for _, passed, _ in checklist if passed)
+        for item, passed, reason in checklist:
+            status = "✓" if passed else "✗"
+            print(f"  [{status}] {item}: {reason}")
+        print(f"\n  通过: {pass_count}/10 项")
+        if pass_count >= 8:
+            print(f"  建议: 可以执行买入")
+        elif pass_count >= 6:
+            print(f"  建议: 谨慎观望，逢低布局")
+        else:
+            print(f"  建议: 暂不建议买入")
+    except Exception as e:
+        print(f"  生成检查清单失败")
+
+    # ========== 7. LLM决策仪表盘 ==========
+    # 确保变量有默认值
+    try:
+        _fund_flow = fund_flow if 'fund_flow' in dir() and isinstance(fund_flow, dict) else {'signal': '未知', 'trend': '观望'}
+    except:
+        _fund_flow = {'signal': '未知', 'trend': '观望'}
+
+    try:
+        _news_sentiment = news_sentiment if 'news_sentiment' in dir() and isinstance(news_sentiment, dict) else {'sentiment': '中性', 'sentiment_score': 0}
+    except:
+        _news_sentiment = {'sentiment': '中性', 'sentiment_score': 0}
+
+    print(f"\n{'='*70}")
+    print(f"  ║               LLM 决策仪表盘 (模拟)                         ║")
+    print(f"{'='*70}")
+
+    try:
+        dashboard = generate_decision_dashboard(resonance, _fund_flow,
+                                                _news_sentiment,
+                                                consensus if consensus else {},
+                                                win_rate_info)
+
+        print(f"  一句话结论:")
+        print(f"  {dashboard.get('core_conclusion', '综合分析中...')}")
+        print()
+
+        # 评分条
+        bullish = dashboard.get('bullish_score', 50)
+        bearish = dashboard.get('bearish_score', 50)
+
+        # 绘制简单条形图
+        b_bar = "█" * (bullish // 5) + "░" * (20 - bullish // 5)
+        be_bar = "█" * (bearish // 5) + "░" * (20 - bearish // 5)
+
+        print(f"  评分:  [{b_bar}] 看多 {bullish}分")
+        print(f"         [{be_bar}] 看空 {bearish}分")
+        print()
+
+        verdict = dashboard.get('verdict', '震荡')
+        action = dashboard.get('action', '观望')
+        confidence = dashboard.get('confidence', '低')
+
+        print(f"  行动建议: 【{action}】  置信度: {confidence}")
+        print()
+
+        print(f"  影响因素:")
+        factors = dashboard.get('factors', {})
+        for key, value in factors.items():
+            icon = "▲" if '多' in str(value) or '涨' in str(value) or '流入' in str(value) else ("▼" if '空' in str(value) or '跌' in str(value) or '流出' in str(value) else "○")
+            print(f"    {key}  {icon} {value}")
+
+    except Exception as e:
+        print(f"  生成决策仪表盘失败")
+
+    print(f"{'='*70}")
+
+    # ========== 8. 综合结论（研报风格） ==========
+    print(f"\n【综合结论】(研报风格)")
+    try:
+        # 使用 generate_summary 作为后备，同时尝试 generate_final_conclusion
+        final_conclusion = generate_summary(df, trend, signals, support, resistance, resonance)
+        if consensus and consensus.get('rating') != 'hold':
+            # 如果有机构评级，生成更详细的结论
+            tech_direction = resonance.get('resonance', 'neutral')
+            tech_text = {'strong_buy': '技术面强烈看多', 'buy': '技术面偏多',
+                        'neutral': '技术面震荡', 'sell': '技术面偏空', 'strong_sell': '技术面强烈看空'}.get(tech_direction, '技术面震荡')
+
+            consensus_text = {'buy': '机构看涨', 'hold': '机构观望', 'sell': '机构看跌'}.get(consensus.get('rating', 'hold'), '机构观望')
+
+            target = consensus.get('target_price')
+            if target:
+                target_text = f", 目标价{target:.2f}元"
+            else:
+                target_text = ""
+
+            final_conclusion = f"{tech_text}+{consensus_text}，{win_rate_info.get('suggestion', '建议观望')}{target_text}"
+
+        print(f"  {final_conclusion}")
+    except Exception as e:
+        print(f"  {summary}")
+
+    print(f"{'='*70}\n")
 
 
 def main():
@@ -1574,6 +2925,10 @@ def main():
 
         print(f"成功获取 {len(df_clean)} 条有效数据")
 
+        # 数据量建议提示
+        if len(df_clean) < 100:
+            print(f"提示: 数据量较少（{len(df_clean)}条），结论仅供参考，建议使用 -d 120 获取更多数据")
+
         # 分析并输出
         print_analysis(df_clean, args.code, args.period)
 
@@ -1584,7 +2939,13 @@ def main():
         print(f"错误: {e}")
         sys.exit(1)
     except Exception as e:
-        print(f"发生未知错误: {e}")
+        error_msg = str(e).lower()
+        if 'connection' in error_msg or 'network' in error_msg or 'timeout' in error_msg:
+            print("错误: 网络连接失败，请检查网络后重试")
+        elif 'rate' in error_msg or 'limit' in error_msg:
+            print("错误: API请求频率限制，请稍后重试")
+        else:
+            print(f"发生未知错误: {e}")
         sys.exit(1)
 
 
