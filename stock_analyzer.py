@@ -6,14 +6,99 @@
 """
 
 import argparse
+import contextlib
+import io
 import sys
 import time
 import re
 from datetime import datetime, timedelta
-from typing import Tuple, Dict, List, Optional
+from typing import Tuple, Dict, List, Optional, Callable, Any
 
 import pandas as pd
 import numpy as np
+
+
+REQUEST_TIMEOUT = 10
+CHART_FETCH_BUFFER_DAYS = 160
+
+
+def normalize_symbol(code: str) -> str:
+    """将用户输入的股票代码转换为数据源可识别的标准代码。"""
+    if code.isdigit() and len(code) == 6:
+        if code.startswith(('6', '5', '9')):
+            return f"{code}.SS"
+        return f"{code}.SZ"
+    return code.upper()
+
+
+def call_with_suppressed_output(func: Callable[[], Any]) -> Any:
+    """抑制第三方库向stdout/stderr输出的噪音。"""
+    stream = io.StringIO()
+    with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
+        return func()
+
+
+def get_history_window_days(period: str, days: int) -> int:
+    """为技术指标预留更长的取数窗口。"""
+    multiplier = 10 if period == 'w' else 2
+    return max(days + 100, days * multiplier, CHART_FETCH_BUFFER_DAYS)
+
+
+def parse_chart_response(data: dict, code: str, period: str, days: int) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    """解析 Yahoo chart API 返回。"""
+    chart = data.get('chart', {})
+    error = chart.get('error')
+    if error:
+        description = error.get('description') or error.get('code') or '未知错误'
+        return None, f"股票代码无效或无数据: {code} ({description})"
+
+    results = chart.get('result') or []
+    if not results:
+        return None, f"股票代码无效或无数据: {code}"
+
+    result = results[0]
+    timestamps = result.get('timestamp')
+    indicators = result.get('indicators', {})
+    quotes = indicators.get('quote') or []
+    quote = quotes[0] if quotes else None
+
+    if not timestamps or not quote:
+        return None, f"无有效行情数据: {code}"
+
+    df = pd.DataFrame({
+        'date': pd.to_datetime(timestamps, unit='s'),
+        'open': quote.get('open'),
+        'high': quote.get('high'),
+        'low': quote.get('low'),
+        'close': quote.get('close'),
+        'volume': quote.get('volume')
+    })
+
+    df = clean_stock_data(df)
+    if df.empty:
+        return None, f"无有效数据: {code}"
+
+    if period == 'w':
+        weekly = (
+            df.set_index('date')
+            .resample('W-FRI')
+            .agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'volume': 'sum',
+            })
+            .dropna()
+            .reset_index()
+        )
+        df = clean_stock_data(weekly)
+
+    df = df.tail(days).reset_index(drop=True)
+    if df.empty:
+        return None, f"数据不足: {code}"
+
+    return df[['date', 'open', 'high', 'low', 'close', 'volume']], None
 
 
 # ============ 数据清洗函数 ============
@@ -155,148 +240,42 @@ def validate_indicators(df: pd.DataFrame) -> Tuple[bool, List[str]]:
     return len(warnings) == 0, warnings
 
 
-def safe_fetch_yfinance(code: str, period: str, days: int) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
-    """安全获取yfinance数据，带错误处理
-
-    Returns:
-        (dataframe, error_message)
-    """
-    try:
-        import yfinance as yf
-    except ImportError:
-        return None, "请安装yfinance: pip install yfinance"
-
-    try:
-        # A股代码转换
-        original_code = code
-        yf_code = code
-        if code.isdigit() and len(code) == 6:
-            if code.startswith(('6', '5', '9')):
-                yf_code = f"{code}.SS"
-            else:
-                yf_code = f"{code}.SZ"
-
-        # 映射周期
-        interval = '1d' if period == 'd' else '1wk'
-
-        # 获取数据 (多获取一些以确保有足够数据计算指标)
-        fetch_days = days + 100
-        ticker = yf.Ticker(yf_code)
-        df = ticker.history(period=f"{fetch_days}d", interval=interval)
-
-        if df.empty:
-            # 尝试使用chart API作为备选
-            return safe_fetch_yfinance_chart(code, period, days)
-
-        df = df.reset_index()
-        df = df.rename(columns={
-            'Date': 'date',
-            'Open': 'open',
-            'Close': 'close',
-            'High': 'high',
-            'Low': 'low',
-            'Volume': 'volume'
-        })
-
-        df['date'] = pd.to_datetime(df['date'])
-
-        # 取最近N条
-        df = df.tail(days).reset_index(drop=True)
-
-        return df[['date', 'open', 'high', 'low', 'close', 'volume']], None
-
-    except Exception as e:
-        error_msg = str(e).lower()
-        error_type = type(e).__name__
-        if 'connection' in error_msg or 'network' in error_msg or 'timeout' in error_msg:
-            # 网络错误，尝试chart API
-            return safe_fetch_yfinance_chart(code, period, days)
-        elif 'rate' in error_msg or '429' in error_msg or error_type == 'YFRateLimitError':
-            # 限速错误，尝试chart API作为备选
-            return safe_fetch_yfinance_chart(code, period, days)
-        else:
-            # 其他错误，尝试chart API
-            return safe_fetch_yfinance_chart(code, period, days)
-
-
 def safe_fetch_yfinance_chart(code: str, period: str, days: int) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
-    """使用Yahoo图表API获取数据（备选方案）
-
-    当history API被限速时使用此方法
-    """
+    """使用 Yahoo chart API 获取行情数据。"""
     try:
         import requests
     except ImportError:
         return None, "请安装requests库"
 
     try:
-        # 转换代码
-        yf_code = code
-        if code.isdigit() and len(code) == 6:
-            if code.startswith(('6', '5', '9')):
-                yf_code = f"{code}.SS"
-            else:
-                yf_code = f"{code}.SZ"
-
-        # 映射周期
-        interval = '1d' if period == 'd' else '1wk'
-
-        # 使用chart API
-        import time
+        yf_code = normalize_symbol(code)
         end_time = int(time.time())
-        start_time = end_time - (days + 30) * 86400  # 多获取一些
+        start_time = end_time - get_history_window_days(period, days) * 86400
 
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_code}"
         params = {
             'period1': start_time,
             'period2': end_time,
-            'interval': interval,
+            'interval': '1d',
             'events': 'history'
         }
         headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'}
 
-        response = requests.get(url, params=params, headers=headers, timeout=30)
+        response = requests.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
 
         if response.status_code != 200:
             return None, f"API请求失败: HTTP {response.status_code}"
 
         data = response.json()
-
-        if 'chart' not in data or 'result' not in data['chart'] or data['chart']['result'] is None:
-            return None, f"股票代码无效或无数据: {code}"
-
-        result = data['chart']['result'][0]
-
-        if 'timestamp' not in result:
-            return None, f"无时间戳数据: {code}"
-
-        timestamps = result['timestamp']
-        quote = result['indicators']['quote'][0]
-
-        # 构建DataFrame
-        df = pd.DataFrame({
-            'date': pd.to_datetime(timestamps, unit='s'),
-            'open': quote['open'],
-            'high': quote['high'],
-            'low': quote['low'],
-            'close': quote['close'],
-            'volume': quote['volume']
-        })
-
-        # 清理数据
-        df = df.dropna()
-        df = df[df['close'].notna() & (df['close'] > 0)]
-
-        if df.empty:
-            return None, f"无有效数据: {code}"
-
-        # 取最近N条
-        df = df.tail(days).reset_index(drop=True)
-
-        return df, None
+        return parse_chart_response(data, code, period, days)
 
     except Exception as e:
         return None, f"获取数据失败: {code} - {type(e).__name__}"
+
+
+def safe_fetch_yfinance(code: str, period: str, days: int) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    """兼容旧调用名，实际走稳定的 chart API。"""
+    return safe_fetch_yfinance_chart(code, period, days)
 
 
 def safe_fetch_akshare(code: str, period: str, days: int) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
@@ -319,7 +298,7 @@ def safe_fetch_akshare(code: str, period: str, days: int) -> Tuple[Optional[pd.D
 
         # 获取数据
         period_str = "daily" if period == 'd' else "weekly"
-        df = ak.stock_zh_a_hist(symbol=symbol, period=period_str, adjust="qfq")
+        df = call_with_suppressed_output(lambda: ak.stock_zh_a_hist(symbol=symbol, period=period_str, adjust="qfq"))
 
         # 标准化列名 - 处理不同版本的列名
         column_mapping = {}
@@ -385,13 +364,8 @@ def generate_demo_data(code: str, period: str, days: int) -> pd.DataFrame:
     return df
 
 
-def fetch_stock_data(code: str, period: str, days: int, retry: int = 3, demo: bool = False) -> pd.DataFrame:
-    """获取股票数据，优先使用yfinance，失败后尝试akshare（仅A股）
-
-    数据源优先级：
-    1. yfinance（支持A股、美股、港股）
-    2. akshare（仅A股备选）
-    """
+def fetch_stock_data(code: str, period: str, days: int, retry: int = 2, demo: bool = False) -> pd.DataFrame:
+    """获取股票数据，优先使用 Yahoo chart API，A 股失败后尝试 akshare。"""
     if demo:
         print("使用演示数据模式")
         return generate_demo_data(code, period, days)
@@ -399,29 +373,23 @@ def fetch_stock_data(code: str, period: str, days: int, retry: int = 3, demo: bo
     is_a_share = code.isdigit() and len(code) == 6
 
     for attempt in range(retry):
-        # 优先使用yfinance
         df, error = safe_fetch_yfinance(code, period, days)
-
         if df is not None:
-            print(f"数据源: yfinance")
+            print("数据源: Yahoo chart API")
             return df
 
-        # yfinance失败，如果是A股则尝试akshare
         if is_a_share:
-            print(f"yfinance获取失败，正在尝试akshare...")
+            print("Yahoo行情获取失败，正在尝试akshare...")
             df, error = safe_fetch_akshare(code, period, days)
-
             if df is not None:
-                print(f"数据源: akshare")
+                print("数据源: akshare")
                 return df
 
-        # 检查是否是限速错误
-        if error and ("rate" in error.lower() or "429" in error):
-            wait_time = (attempt + 1) * 10
+        if error and ("rate" in error.lower() or "429" in error or "http 429" in error.lower()):
+            wait_time = (attempt + 1) * 3
             print(f"API限速，等待{wait_time}秒后重试... ({attempt + 1}/{retry})")
             time.sleep(wait_time)
         else:
-            # 非限速错误，直接报错退出
             raise ValueError(error if error else "获取数据失败，请检查股票代码或网络连接")
 
     raise ValueError("多次重试后仍无法获取数据，请稍后再试")
@@ -463,20 +431,12 @@ def fetch_analyst_consensus(code: str) -> dict:
     # 判断是否为A股
     is_a_share = code.isdigit() and len(code) == 6
 
-    # 尝试使用yfinance获取
+    # 尝试使用 yfinance 获取
     try:
         import yfinance as yf
-
-        # A股代码转换
-        yf_code = code
-        if is_a_share:
-            if code.startswith(('6', '5', '9')):
-                yf_code = f"{code}.SS"
-            else:
-                yf_code = f"{code}.SZ"
-
+        yf_code = normalize_symbol(code)
         ticker = yf.Ticker(yf_code)
-        info = ticker.info
+        info = call_with_suppressed_output(lambda: ticker.info)
 
         if info:
             rec_key = info.get('recommendationKey', '')
@@ -503,15 +463,12 @@ def fetch_analyst_consensus(code: str) -> dict:
                 }
 
     except Exception:
-        pass  # yfinance失败，尝试akshare
+        pass
 
-    # A股尝试使用akshare
     if is_a_share:
         try:
             import akshare as ak
-
-            # 使用东方财富研报接口
-            df = ak.stock_rank_forecast_cninfo(symbol=code)
+            df = call_with_suppressed_output(lambda: ak.stock_rank_forecast_cninfo(symbol=code))
 
             if df is not None and not df.empty:
                 # 统计评级（假设列名包含"评级"或类似字段）
@@ -601,7 +558,7 @@ def fetch_chip_distribution(code: str) -> dict:
         import akshare as ak
 
         # 获取筹码分布数据
-        df = ak.stock_cyq_em(symbol=code)
+        df = call_with_suppressed_output(lambda: ak.stock_cyq_em(symbol=code))
 
         if df is None or df.empty:
             default_result['source'] = '数据为空'
@@ -738,7 +695,7 @@ def fetch_fund_flow(code: str, df: pd.DataFrame = None) -> dict:
             import akshare as ak
 
             # 获取行业资金流
-            df_flow = ak.stock_fund_flow_industry()
+            df_flow = call_with_suppressed_output(lambda: ak.stock_fund_flow_industry())
 
             if df_flow is not None and not df_flow.empty:
                 # 尝试找到目标股票对应的行业
@@ -862,24 +819,13 @@ def fetch_news_sentiment(code: str) -> dict:
         'source': '获取失败'
     }
 
-    # 判断股票代码
     is_a_share = code.isdigit() and len(code) == 6
 
     try:
         import yfinance as yf
-
-        # 转换代码
-        yf_code = code
-        if is_a_share:
-            if code.startswith(('6', '5', '9')):
-                yf_code = f"{code}.SS"
-            else:
-                yf_code = f"{code}.SZ"
-
+        yf_code = normalize_symbol(code)
         ticker = yf.Ticker(yf_code)
-
-        # 获取新闻
-        news_data = ticker.news
+        news_data = call_with_suppressed_output(lambda: ticker.news)
 
         if not news_data:
             default_result['source'] = '暂无新闻'
@@ -988,9 +934,6 @@ def get_market_review() -> dict:
     }
 
     try:
-        import yfinance as yf
-
-        # 指数代码列表
         index_codes = {
             '上证指数': '^SSEC',
             '深证成指': '^SZCOMP',
@@ -1003,26 +946,19 @@ def get_market_review() -> dict:
         changes = []
 
         for name, code in index_codes.items():
-            try:
-                ticker = yf.Ticker(code)
-                hist = ticker.history(period='5d')
+            hist, _ = safe_fetch_yfinance_chart(code, 'd', 5)
+            if hist is not None and len(hist) >= 2:
+                current_price = hist['close'].iloc[-1]
+                prev_price = hist['close'].iloc[-2]
+                change = (current_price - prev_price) / prev_price * 100
+                indices[name] = {
+                    'code': code,
+                    'price': round(current_price, 2),
+                    'change': round(change, 2)
+                }
+                changes.append(change)
 
-                if hist is not None and len(hist) >= 2:
-                    current_price = hist['Close'].iloc[-1]
-                    prev_price = hist['Close'].iloc[-2]
-                    change = (current_price - prev_price) / prev_price * 100
-
-                    indices[name] = {
-                        'code': code,
-                        'price': round(current_price, 2),
-                        'change': round(change, 2)
-                    }
-                    changes.append(change)
-
-            except Exception:
-                pass
-
-        # 判断市场状态
+        market_status = '数据不足'
         if changes:
             avg_change = sum(changes) / len(changes)
             pos_count = sum(1 for c in changes if c > 0)
@@ -1040,15 +976,11 @@ def get_market_review() -> dict:
         default_result['indices'] = indices
         default_result['market_status'] = market_status
 
-        # 尝试获取A股板块数据
         try:
             import akshare as ak
-
-            # 获取板块资金流
-            df_sector = ak.stock_fund_flow_industry()
+            df_sector = call_with_suppressed_output(lambda: ak.stock_fund_flow_industry())
 
             if df_sector is not None and not df_sector.empty:
-                # 尝试找到涨跌幅列
                 sector_name_col = None
                 change_col = None
                 inflow_col = None
@@ -1068,25 +1000,21 @@ def get_market_review() -> dict:
                         name = row.get(sector_name_col, '')
                         change = row.get(change_col, 0)
                         inflow = row.get(inflow_col, 0) if inflow_col else 0
-
+                        name_str = str(name).strip()
+                        if not name_str or re.fullmatch(r'[-+]?\d+(\.\d+)?', name_str):
+                            continue
                         sectors.append({
-                            'name': str(name),
+                            'name': name_str,
                             'change': round(float(change), 2) if pd.notna(change) else 0,
                             'inflow': round(float(inflow), 2) if pd.notna(inflow) else 0
                         })
-
                     default_result['sectors'] = sectors
-
         except Exception:
             pass
 
         return default_result
-
-    except ImportError:
-        default_result['market_status'] = '请安装yfinance'
     except Exception as e:
         default_result['market_status'] = f'获取失败: {type(e).__name__}'
-
     return default_result
 
 
@@ -1482,78 +1410,6 @@ def generate_decision_dashboard(resonance: dict, fund_flow: dict,
             '机构': consensus_dir
         }
     }
-    # 判断技术面方向
-    tech_direction = resonance.get('resonance', 'neutral')
-    tech_bullish = tech_direction in ['strong_buy', 'buy']
-    tech_bearish = tech_direction in ['sell', 'strong_sell']
-
-    # 判断机构共识方向
-    inst_rating = consensus.get('rating', 'hold')
-    inst_bullish = inst_rating == 'buy'
-    inst_bearish = inst_rating == 'sell'
-
-    # 构建结论
-    parts = []
-
-    # 技术面描述
-    if tech_direction == 'strong_buy':
-        tech_desc = "技术面强烈看多"
-    elif tech_direction == 'buy':
-        tech_desc = "技术面偏多"
-    elif tech_direction == 'sell':
-        tech_desc = "技术面偏空"
-    elif tech_direction == 'strong_sell':
-        tech_desc = "技术面强烈看空"
-    else:
-        tech_desc = "技术面中性"
-
-    # 机构共识描述
-    if inst_rating == 'buy':
-        inst_desc = "机构共识看涨"
-    elif inst_rating == 'sell':
-        inst_desc = "机构共识看跌"
-    else:
-        inst_desc = "机构评级中性"
-
-    # 综合判断
-    if tech_bullish and inst_bullish:
-        action = "技术面+机构共识均偏多，建议逢低加仓"
-        if support:
-            action += f"，支撑参考{support[0]:.2f}"
-    elif tech_bullish and inst_bearish:
-        action = "技术面偏多但机构谨慎，建议轻仓试探，设好止损"
-    elif tech_bearish and inst_bullish:
-        action = "机构看好但技术面偏弱，建议等待技术确认后再介入"
-    elif tech_bearish and inst_bearish:
-        action = "技术面+机构共识均偏空，建议减仓观望"
-        if resistance:
-            action += f"，压力位参考{resistance[0]:.2f}"
-    else:
-        # 分歧或中性状态
-        buy_count = len(resonance.get('buy_indicators', []))
-        sell_count = len(resonance.get('sell_indicators', []))
-        if abs(buy_count - sell_count) <= 1:
-            action = "多空分歧明显，建议观望等待明确信号"
-        else:
-            action = "趋势不明朗，建议谨慎操作"
-
-    # 添加胜率参考
-    win_rate_val = win_rate.get('win_rate', 50)
-    if win_rate_val >= 70:
-        confidence = "高置信度"
-    elif win_rate_val >= 55:
-        confidence = "中等置信度"
-    else:
-        confidence = "低置信度"
-
-    # 构建最终结论
-    conclusion = f"{tech_desc}，{inst_desc}。{action}。胜率{win_rate_val:.0f}%（{confidence}）"
-
-    # 添加止损建议（使用支撑位或ATR）
-    if support and tech_bullish:
-        conclusion += f"，止损可参考{support[0]:.2f}下方"
-
-    return conclusion
 
 
 # ============ 技术指标计算函数 ============
@@ -2598,7 +2454,39 @@ def format_table(rows: List[Tuple[str, str, str]], headers: Tuple[str, str, str]
     return "\n".join(lines)
 
 
-def print_analysis(df: pd.DataFrame, code: str, period: str):
+def build_optional_context(code: str, df: pd.DataFrame, demo: bool = False) -> dict:
+    """按需获取扩展信息，失败时只回落到默认值。"""
+    context = {
+        'market_review': {'indices': {}, 'sectors': [], 'market_status': '已跳过'},
+        'chip_dist': {'source': '已跳过'},
+        'fund_flow': fetch_fund_flow(code, df),
+        'news_sentiment': {'news': [], 'sentiment': '中性', 'sentiment_score': 0, 'summary': '暂无新闻数据', 'source': '为保障流程稳定已跳过'},
+        'consensus': {'rating': 'hold', 'rating_text': '暂无评级数据', 'target_price': None, 'analyst_count': 0, 'source': '为保障流程稳定已跳过'},
+        'notes': [],
+    }
+
+    if demo:
+        context['notes'].append('演示模式已跳过联网扩展数据')
+        context['chip_dist'] = {'source': '演示模式已跳过'}
+        context['market_review']['market_status'] = '演示模式已跳过'
+        context['news_sentiment']['source'] = '演示模式已跳过'
+        context['consensus']['source'] = '演示模式已跳过'
+        return context
+
+    try:
+        context['market_review'] = get_market_review()
+    except Exception:
+        context['notes'].append('大盘复盘获取失败，已跳过')
+
+    try:
+        context['chip_dist'] = fetch_chip_distribution(code)
+    except Exception:
+        context['chip_dist'] = {'source': '获取失败'}
+
+    return context
+
+
+def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False):
     """打印分析结果（表格格式）
 
     输出顺序：大盘复盘 → 指标表格 → 筹码/资金流 → 新闻情绪 → 买卖点+清单 → 决策仪表盘 → 综合结论
@@ -2623,6 +2511,7 @@ def print_analysis(df: pd.DataFrame, code: str, period: str):
     indicators = analyze_indicator_signals(df)
     resonance = calculate_resonance(indicators)
     win_rate_info = calculate_win_rate(indicators, resonance, df)
+    context = build_optional_context(code, df, demo=demo)
 
     summary = generate_summary(df, trend, signals, support, resistance, resonance)
 
@@ -2631,27 +2520,26 @@ def print_analysis(df: pd.DataFrame, code: str, period: str):
     print(f"\n{'='*70}")
     print(f"  股票代码: {code} | 周期: {period_name} | 综合技术分析")
     print(f"{'='*70}")
+    for note in context['notes']:
+        print(f"  说明: {note}")
 
     # ========== 1. 大盘复盘 ==========
     print(f"\n【大盘复盘】")
-    try:
-        market_review = get_market_review()
-        if market_review.get('indices'):
-            for name, data in market_review['indices'].items():
-                change_str = f"+{data['change']:.2f}%" if data['change'] > 0 else f"{data['change']:.2f}%"
-                print(f"  {name}: {data['price']} ({change_str})")
-            print(f"  市场状态: {market_review.get('market_status', '未知')}")
+    market_review = context['market_review']
+    if market_review.get('indices'):
+        for name, data in market_review['indices'].items():
+            change_str = f"+{data['change']:.2f}%" if data['change'] > 0 else f"{data['change']:.2f}%"
+            print(f"  {name}: {data['price']} ({change_str})")
+        print(f"  市场状态: {market_review.get('market_status', '未知')}")
 
-            if market_review.get('sectors'):
-                print(f"\n  热门板块(前5):")
-                for sector in market_review['sectors']:
-                    change_s = f"+{sector['change']:.2f}%" if sector['change'] > 0 else f"{sector['change']:.2f}%"
-                    inflow_s = f"+{sector['inflow']:.1f}亿" if sector['inflow'] > 0 else f"{sector['inflow']:.1f}亿"
-                    print(f"    {sector['name']}: {change_s} 主力{inflow_s}")
-        else:
-            print("  暂无法获取大盘数据")
-    except Exception as e:
-        print(f"  获取大盘数据失败")
+        if market_review.get('sectors'):
+            print(f"\n  热门板块(前5):")
+            for sector in market_review['sectors']:
+                change_s = f"+{sector['change']:.2f}%" if sector['change'] > 0 else f"{sector['change']:.2f}%"
+                inflow_s = f"+{sector['inflow']:.1f}亿" if sector['inflow'] > 0 else f"{sector['inflow']:.1f}亿"
+                print(f"    {sector['name']}: {change_s} 主力{inflow_s}")
+    else:
+        print(f"  暂无法获取大盘数据 ({market_review.get('market_status', '未知')})")
 
     # ========== 2. 最新数据和技术指标 ==========
     print(f"\n【最新数据】")
@@ -2766,81 +2654,68 @@ def print_analysis(df: pd.DataFrame, code: str, period: str):
     print(f"\n【筹码分布与资金流向】")
 
     # 筹码分布
-    try:
-        chip_dist = fetch_chip_distribution(code)
-        if chip_dist.get('source') == '东方财富筹码分布' and chip_dist.get('price'):
-            print(f"  当前股价: {chip_dist['price']:.2f}")
-            if chip_dist.get('main_cost_area'):
-                print(f"  主力成本区: {chip_dist['main_cost_area']}元区间")
-            print(f"  筹码集中度: {chip_dist.get('concentration', '未知')}")
-            if chip_dist.get('profit_ratio') is not None:
-                print(f"  获利盘: {chip_dist['profit_ratio']:.1f}%")
-            if chip_dist.get('float_ratio') is not None:
-                print(f"  浮筹比例: 约{chip_dist['float_ratio']:.1f}%")
-        else:
-            print(f"  筹码分布: {chip_dist.get('source', '获取失败')}")
-    except Exception as e:
-        print(f"  筹码分布: 获取失败")
+    chip_dist = context['chip_dist']
+    if chip_dist.get('source') == '东方财富筹码分布' and chip_dist.get('price'):
+        print(f"  当前股价: {chip_dist['price']:.2f}")
+        if chip_dist.get('main_cost_area'):
+            print(f"  主力成本区: {chip_dist['main_cost_area']}元区间")
+        print(f"  筹码集中度: {chip_dist.get('concentration', '未知')}")
+        if chip_dist.get('profit_ratio') is not None:
+            print(f"  获利盘: {chip_dist['profit_ratio']:.1f}%")
+        if chip_dist.get('float_ratio') is not None:
+            print(f"  浮筹比例: 约{chip_dist['float_ratio']:.1f}%")
+    else:
+        print(f"  筹码分布: {chip_dist.get('source', '获取失败')}")
 
     # 主力资金流向
-    try:
-        fund_flow = fetch_fund_flow(code, df)
-        if fund_flow.get('source') and fund_flow.get('source') != '获取失败':
-            inflow_today = fund_flow.get('main_inflow_today')
-            inflow_5d = fund_flow.get('main_inflow_5d')
-            signal = fund_flow.get('signal', '未知')
-            trend_f = fund_flow.get('trend', '观望')
-            vol_ratio = fund_flow.get('volume_ratio')
+    fund_flow = context['fund_flow']
+    if fund_flow.get('source') and fund_flow.get('source') != '获取失败':
+        inflow_today = fund_flow.get('main_inflow_today')
+        inflow_5d = fund_flow.get('main_inflow_5d')
+        signal = fund_flow.get('signal', '未知')
+        trend_f = fund_flow.get('trend', '观望')
+        vol_ratio = fund_flow.get('volume_ratio')
 
-            if inflow_today is not None:
-                inflow_str = f"+{inflow_today:.0f}万" if inflow_today > 0 else f"{inflow_today:.0f}万"
-                print(f"  当日主力净流入: {inflow_str}")
-            if inflow_5d is not None:
-                inflow_5d_str = f"+{inflow_5d:.0f}万" if inflow_5d > 0 else f"{inflow_5d:.0f}万"
-                print(f"  5日累计净流入: {inflow_5d_str}")
-            print(f"  资金动向: {signal} ({trend_f})")
-            if vol_ratio:
-                print(f"  量比: {vol_ratio:.2f}")
-            print(f"  数据来源: {fund_flow.get('source', '技术分析')}")
-        else:
-            print(f"  主力资金流: 数据不足")
-    except Exception as e:
-        print(f"  主力资金流: 获取失败")
+        if inflow_today is not None:
+            inflow_str = f"+{inflow_today:.0f}万" if inflow_today > 0 else f"{inflow_today:.0f}万"
+            print(f"  当日主力净流入: {inflow_str}")
+        if inflow_5d is not None:
+            inflow_5d_str = f"+{inflow_5d:.0f}万" if inflow_5d > 0 else f"{inflow_5d:.0f}万"
+            print(f"  5日累计净流入: {inflow_5d_str}")
+        print(f"  资金动向: {signal} ({trend_f})")
+        if vol_ratio:
+            print(f"  量比: {vol_ratio:.2f}")
+        print(f"  数据来源: {fund_flow.get('source', '技术分析')}")
+    else:
+        print("  主力资金流: 数据不足")
 
     # ========== 4. 新闻舆情 ==========
     print(f"\n【市场舆情】")
-    try:
-        news_sentiment = fetch_news_sentiment(code)
-        if news_sentiment.get('news'):
-            print(f"  最新新闻(最近5条):")
-            for i, news in enumerate(news_sentiment['news'][:5], 1):
-                title = news.get('title', '')[:40]
-                source = news.get('source', '未知')
-                print(f"    {i}. {title} ({source})")
+    news_sentiment = context['news_sentiment']
+    if news_sentiment.get('news'):
+        print(f"  最新新闻(最近5条):")
+        for i, news in enumerate(news_sentiment['news'][:5], 1):
+            title = news.get('title', '')[:40]
+            source = news.get('source', '未知')
+            print(f"    {i}. {title} ({source})")
 
-            sentiment = news_sentiment.get('sentiment', '中性')
-            score = news_sentiment.get('sentiment_score', 0)
-            summary = news_sentiment.get('summary', '')
-            print(f"\n  情绪分析: {sentiment} (评分: {score:+d})")
-            print(f"  总结: {summary}")
-        else:
-            print(f"  暂无新闻数据")
-    except Exception as e:
-        print(f"  获取新闻失败")
+        sentiment = news_sentiment.get('sentiment', '中性')
+        score = news_sentiment.get('sentiment_score', 0)
+        summary = news_sentiment.get('summary', '')
+        print(f"\n  情绪分析: {sentiment} (评分: {score:+d})")
+        print(f"  总结: {summary}")
+    else:
+        print(f"  暂无新闻数据 ({news_sentiment.get('source', '无数据')})")
 
     # ========== 5. 分析师共识（机构评级） ==========
     print(f"\n【机构评级】")
-    consensus = None
-    try:
-        consensus = fetch_analyst_consensus(code)
-        print(f"  机构评级: {consensus['rating_text']}")
-        if consensus['target_price']:
-            print(f"  目标价: {consensus['target_price']:.2f}")
-        if consensus['analyst_count'] > 0:
-            print(f"  分析师数量: {consensus['analyst_count']}位")
-        print(f"  数据来源: 基于{consensus['source']}汇总")
-    except Exception as e:
-        print("  暂无法获取分析师评级数据")
+    consensus = context['consensus']
+    print(f"  机构评级: {consensus['rating_text']}")
+    if consensus['target_price']:
+        print(f"  目标价: {consensus['target_price']:.2f}")
+    if consensus['analyst_count'] > 0:
+        print(f"  分析师数量: {consensus['analyst_count']}位")
+    print(f"  数据来源: 基于{consensus['source']}汇总")
 
     # ========== 6. 买卖点分析 + 检查清单 ==========
     print(f"\n【买卖点分析】")
@@ -2877,16 +2752,8 @@ def print_analysis(df: pd.DataFrame, code: str, period: str):
         print(f"  生成检查清单失败")
 
     # ========== 7. LLM决策仪表盘 ==========
-    # 确保变量有默认值
-    try:
-        _fund_flow = fund_flow if 'fund_flow' in dir() and isinstance(fund_flow, dict) else {'signal': '未知', 'trend': '观望'}
-    except:
-        _fund_flow = {'signal': '未知', 'trend': '观望'}
-
-    try:
-        _news_sentiment = news_sentiment if 'news_sentiment' in dir() and isinstance(news_sentiment, dict) else {'sentiment': '中性', 'sentiment_score': 0}
-    except:
-        _news_sentiment = {'sentiment': '中性', 'sentiment_score': 0}
+    _fund_flow = fund_flow if isinstance(fund_flow, dict) else {'signal': '未知', 'trend': '观望'}
+    _news_sentiment = news_sentiment if isinstance(news_sentiment, dict) else {'sentiment': '中性', 'sentiment_score': 0}
 
     print(f"\n{'='*70}")
     print(f"  ║               LLM 决策仪表盘 (模拟)                         ║")
@@ -2986,6 +2853,7 @@ def main():
                         help='使用演示数据模式（无需网络）')
 
     args = parser.parse_args()
+    args.code = args.code.upper()
 
     try:
         # 验证股票代码格式
@@ -3015,7 +2883,7 @@ def main():
             print(f"提示: 数据量较少（{len(df_clean)}条），结论仅供参考，建议使用 -d 120 获取更多数据")
 
         # 分析并输出
-        print_analysis(df_clean, args.code, args.period)
+        print_analysis(df_clean, args.code, args.period, demo=args.demo)
 
     except KeyboardInterrupt:
         print("\n操作已取消")

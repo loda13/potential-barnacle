@@ -2,10 +2,12 @@
 
 命令行股票技术分析工具，支持A股/美股/港股，提供多指标共振分析、资金流向、新闻舆情、买卖点决策等完整分析体系。
 
+核心K线行情默认使用 Yahoo chart API；新闻、评级、筹码、大盘复盘等扩展信息会在失败时自动降级，不会中断主分析流程。
+
 ## 安装
 
 ```bash
-pip3 install pandas numpy yfinance akshare
+pip3 install -r requirements.txt
 ```
 
 > 注：已支持纯pandas/numpy实现，无需安装pandas_ta
@@ -22,8 +24,15 @@ python3 stock_analyzer.py AAPL -p w -d 240
 # 港股（腾讯控股）
 python3 stock_analyzer.py 0700.HK -d 60
 
-# 演示模式（离线，无需网络）
-python3 stock_analyzer.py 600519 --demo
+# 港股（小米集团）
+python3 stock_analyzer.py 1810.HK -d 60
+
+# 美股（特斯拉 / 英伟达）
+python3 stock_analyzer.py TSLA -d 60
+python3 stock_analyzer.py NVDA -d 60
+
+# 演示模式（离线，不拉取扩展网络数据）
+python3 stock_analyzer.py TSLA --demo
 ```
 
 ## 参数说明
@@ -34,6 +43,12 @@ python3 stock_analyzer.py 600519 --demo
 | `-p, --period` | K线周期：`d`=日线，`w`=周线 | `d` |
 | `-d, --days` | 分析天数/周数（周线建议≥240） | `60` |
 | `--demo` | 演示模式，使用模拟数据 | 关闭 |
+
+## 运行说明
+
+- 核心分析成功的判定标准是：命令可以输出完整技术分析结果，即使部分扩展数据源返回“暂无数据”或“获取失败”也不会中断。
+- `--demo` 模式只使用本地模拟K线数据，并跳过大盘、新闻、评级、筹码等联网扩展数据。
+- A股在 Yahoo 行情失败时会自动尝试 `akshare` 作为备选。
 
 ## 功能特性
 
@@ -56,9 +71,9 @@ python3 stock_analyzer.py 600519 --demo
 | 功能 | 说明 | 数据源 |
 |------|------|--------|
 | 筹码分布 | 集中度、主力成本区、浮筹比例 | akshare |
-| 主力资金流 | 当日/5日净流入、量比、资金动向 | akshare/yfinance |
+| 主力资金流 | 当日/5日净流入、量比、资金动向 | akshare/技术分析 |
 | 市场舆情 | 最近5条新闻、情绪分析 | yfinance |
-| 大盘复盘 | 主要指数涨跌幅、热门板块 | yfinance/akshare |
+| 大盘复盘 | 主要指数涨跌幅、热门板块 | Yahoo chart API/akshare |
 | 精确买卖点 | 买入价/止损价/目标价、风险报酬比 | 指标计算 |
 | 操作检查清单 | 10项买入条件检查 | 指标计算 |
 | LLM决策仪表盘 | 综合评分、行动建议 | 规则评分 |
