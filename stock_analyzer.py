@@ -19,7 +19,7 @@ import numpy as np
 
 
 REQUEST_TIMEOUT = 10
-CHART_FETCH_BUFFER_DAYS = 160
+CHART_FETCH_BUFFER_DAYS = 320
 
 
 def normalize_symbol(code: str) -> str:
@@ -41,7 +41,7 @@ def call_with_suppressed_output(func: Callable[[], Any]) -> Any:
 def get_history_window_days(period: str, days: int) -> int:
     """为技术指标预留更长的取数窗口。"""
     multiplier = 10 if period == 'w' else 2
-    return max(days + 100, days * multiplier, CHART_FETCH_BUFFER_DAYS)
+    return max(days + 200, days * multiplier, CHART_FETCH_BUFFER_DAYS)
 
 
 def parse_chart_response(data: dict, code: str, period: str, days: int) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
@@ -340,15 +340,16 @@ def safe_fetch_akshare(code: str, period: str, days: int) -> Tuple[Optional[pd.D
 
 def generate_demo_data(code: str, period: str, days: int) -> pd.DataFrame:
     """生成演示数据（用于测试）"""
+    effective_days = max(days, 300)  # 确保足够数据用于200日均线等计算
     np.random.seed(42)
-    dates = pd.date_range(end=pd.Timestamp('2024-01-15'), periods=days, freq='D')
+    dates = pd.date_range(end=pd.Timestamp('2024-01-15'), periods=effective_days, freq='D')
 
     # 模拟股票走势
     base_price = 100 if not code.isdigit() else float(code[:3])
     prices = [base_price]
-    for i in range(1, days):
+    for i in range(1, effective_days):
         # 添加趋势和随机波动
-        trend = 0.05 if i < days // 2 else -0.03  # 先涨后跌
+        trend = 0.05 if i < effective_days // 2 else -0.03  # 先涨后跌
         change = np.random.randn() * 2 + trend
         prices.append(max(1, prices[-1] + change))
 
@@ -358,7 +359,7 @@ def generate_demo_data(code: str, period: str, days: int) -> pd.DataFrame:
         'high': [p + abs(np.random.randn() * 1.5) for p in prices],
         'low': [p - abs(np.random.randn() * 1.5) for p in prices],
         'close': [p + np.random.randn() * 0.5 for p in prices],
-        'volume': [1000000 + np.random.randint(-200000, 200000) for _ in range(days)]
+        'volume': [1000000 + np.random.randint(-200000, 200000) for _ in range(effective_days)]
     })
 
     return df
@@ -1021,10 +1022,11 @@ def get_market_review() -> dict:
 # ============ 精确买卖/止损/目标价 + 检查清单 ============
 
 def calculate_price_targets(df: pd.DataFrame, resonance: dict, consensus: dict,
-                           support: list, resistance: list) -> dict:
+                           support: list, resistance: list, contrarian: dict = None) -> dict:
     """计算精确的买卖价格和止损价
 
     买入价计算逻辑:
+    - 最优先: 回调到看多Order Block上沿
     - 优先: 回调到支撑位附近
     - 次选: 回调到MA10/MA20均线
     - 备选: 当前价格 * 0.98
@@ -1058,8 +1060,17 @@ def calculate_price_targets(df: pd.DataFrame, resonance: dict, consensus: dict,
         buy_price = None
         buy_reason = ''
 
+        # 方案0 (最高优先级): Order Block zone
+        if contrarian and contrarian.get('sr_institutional', {}).get('order_blocks'):
+            bullish_obs = [ob for ob in contrarian['sr_institutional']['order_blocks']
+                           if ob['type'] == 'bullish' and ob['price_high'] < current_price]
+            if bullish_obs:
+                nearest_ob = max(bullish_obs, key=lambda x: x['price_high'])
+                buy_price = nearest_ob['price_high']
+                buy_reason = f'回调至看多Order Block({nearest_ob["price_low"]:.2f}-{nearest_ob["price_high"]:.2f})'
+
         # 方案1: 支撑位附近
-        if support:
+        if buy_price is None and support:
             nearest_support = min(support, key=lambda x: abs(x - current_price))
             if nearest_support < current_price:
                 buy_price = nearest_support
@@ -1175,8 +1186,8 @@ def calculate_price_targets(df: pd.DataFrame, resonance: dict, consensus: dict,
 
 
 def generate_checklist(df: pd.DataFrame, resonance: dict, signals: dict,
-                      indicators: dict) -> list:
-    """生成10项买入检查清单
+                      indicators: dict, contrarian: dict = None) -> list:
+    """生成12项买入检查清单
 
     Returns:
         [(检查项, 是否通过, 原因), ...]
@@ -1280,6 +1291,26 @@ def generate_checklist(df: pd.DataFrame, resonance: dict, signals: dict,
     reason = f"技术面{res}" if is_ok else "技术面偏弱"
     results.append(("技术面共振偏多", is_ok, reason))
 
+    # 11. Z-Score未超买
+    if contrarian and contrarian.get('zscore', {}).get('sufficient_data'):
+        zs = contrarian['zscore']['zscore']
+        is_ok = zs < 2.0
+        reason = f"Z-Score={zs:.2f}" if is_ok else f"Z-Score超买({zs:.2f})"
+    else:
+        is_ok = True
+        reason = "数据不足，跳过"
+    results.append(("Z-Score未超买(<2.0)", is_ok, reason))
+
+    # 12. 无看空背离
+    if contrarian and contrarian.get('divergence'):
+        bearish_count = contrarian['divergence'].get('bearish_div_count', 0)
+        is_ok = bearish_count == 0
+        reason = "无看空背离" if is_ok else f"{bearish_count}重看空背离"
+    else:
+        is_ok = True
+        reason = "数据不足，跳过"
+    results.append(("无看空背离", is_ok, reason))
+
     return results
 
 
@@ -1287,14 +1318,15 @@ def generate_checklist(df: pd.DataFrame, resonance: dict, signals: dict,
 
 def generate_decision_dashboard(resonance: dict, fund_flow: dict,
                                 sentiment: dict, consensus: dict,
-                                win_rate: dict) -> dict:
+                                win_rate: dict, contrarian: dict = None) -> dict:
     """生成LLM风格决策仪表盘（零成本实现）
 
     评分权重:
-    - 技术面(40%): strong_buy=90, buy=70, neutral=50, sell=30, strong_sell=10
-    - 资金面(30%): 持续流入=80, 流入=65, 观望=50, 流出=35, 持续流出=20
-    - 舆情(15%): 利好=80, 中性=50, 利空=20
-    - 机构(15%): buy=85, hold=50, sell=15
+    - 技术面(30%): strong_buy=90, buy=70, neutral=50, sell=30, strong_sell=10
+    - 资金面(25%): 持续流入=80, 流入=65, 观望=50, 流出=35, 持续流出=20
+    - 舆情(10%): 利好=80, 中性=50, 利空=20
+    - 机构(10%): buy=85, hold=50, sell=15
+    - 左侧信号(25%): 来自contrarian composite_score
 
     Returns:
         {
@@ -1349,8 +1381,14 @@ def generate_decision_dashboard(resonance: dict, fund_flow: dict,
         'sell': 15
     }.get(consensus_rating, 50)
 
+    # 左侧信号评分 (25%)
+    contrarian_score = 50
+    if contrarian and contrarian.get('composite_score') is not None:
+        contrarian_score = contrarian['composite_score']
+
     # 计算综合评分
-    bullish_score = int(tech_score * 0.4 + fund_score * 0.3 + sent_score * 0.15 + institution_score * 0.15)
+    bullish_score = int(tech_score * 0.30 + fund_score * 0.25 + sent_score * 0.10 +
+                        institution_score * 0.10 + contrarian_score * 0.25)
     bearish_score = 100 - bullish_score
 
     # 震荡评分（基于ADX或市场状态）
@@ -1392,8 +1430,9 @@ def generate_decision_dashboard(resonance: dict, fund_flow: dict,
     fund_dir = '流入' if fund_score >= 60 else ('流出' if fund_score <= 40 else '观望')
     sent_dir = sentiment.get('sentiment', '中性')
     consensus_dir = {'buy': '看涨', 'hold': '观望', 'sell': '看跌'}.get(consensus_rating, '观望')
+    contrarian_dir = '左侧看多' if contrarian_score >= 65 else ('左侧看空' if contrarian_score <= 35 else '左侧中性')
 
-    core_conclusion = f"技术面{tech_dir}+资金{fund_dir}+舆情{sent_dir}+机构{consensus_dir}，综合评分{bullish_score}分"
+    core_conclusion = f"技术面{tech_dir}+资金{fund_dir}+舆情{sent_dir}+机构{consensus_dir}+{contrarian_dir}，综合评分{bullish_score}分"
 
     return {
         'core_conclusion': core_conclusion,
@@ -1407,7 +1446,8 @@ def generate_decision_dashboard(resonance: dict, fund_flow: dict,
             '技术面': tech_dir,
             '资金面': fund_dir,
             '舆情': sent_dir,
-            '机构': consensus_dir
+            '机构': consensus_dir,
+            '左侧信号': contrarian_dir
         }
     }
 
@@ -1570,6 +1610,14 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
         df['ICH_KIJUN'] = np.nan
         df['ICH_SSA'] = np.nan
         df['ICH_SSB'] = np.nan
+
+    # MA200 + 标准差（左侧交易Z-Score用）
+    try:
+        df['MA200'] = calc_sma(df['close'], 200)
+        df['MA200_std'] = df['close'].rolling(200).std()
+    except Exception:
+        df['MA200'] = np.nan
+        df['MA200_std'] = np.nan
 
     return df
 
@@ -1861,6 +1909,549 @@ def calc_ichimoku(df: pd.DataFrame, tenkan: int = 9, kijun: int = 26, senkou: in
 
     return df
 
+
+# ============ 左侧交易模块 (Contrarian / Left-Side Trading) ============
+
+def calc_mean_reversion_zscore(df: pd.DataFrame, ma_period: int = 200) -> dict:
+    """均值回归Z-Score分析
+
+    计算价格偏离200日均线的标准差倍数，识别极端超卖区域。
+    """
+    result = {
+        'zscore': 0.0, 'ma200': None, 'deviation_pct': 0.0,
+        'signal': 'neutral', 'signal_text': '数据不足',
+        'score': 50, 'sufficient_data': False
+    }
+    try:
+        if len(df) < ma_period + 20:
+            return result
+
+        ma200 = df['MA200'].iloc[-1]
+        std200 = df['MA200_std'].iloc[-1]
+        close = df['close'].iloc[-1]
+
+        if pd.isna(ma200) or pd.isna(std200) or std200 == 0:
+            return result
+
+        zscore = (close - ma200) / std200
+        deviation_pct = (close - ma200) / ma200 * 100
+        result['zscore'] = round(zscore, 2)
+        result['ma200'] = round(ma200, 2)
+        result['deviation_pct'] = round(deviation_pct, 1)
+        result['sufficient_data'] = True
+
+        if zscore < -2.5:
+            result.update(signal='extreme_oversold', score=95,
+                          signal_text=f'极度超卖(Z={zscore:.2f})，强烈左侧买入信号')
+        elif zscore < -2.0:
+            result.update(signal='oversold', score=80,
+                          signal_text=f'超卖区(Z={zscore:.2f})，左侧买入信号')
+        elif zscore < -1.0:
+            result.update(signal='mild_oversold', score=65,
+                          signal_text=f'偏低(Z={zscore:.2f})，关注左侧机会')
+        elif zscore > 2.5:
+            result.update(signal='extreme_overbought', score=5,
+                          signal_text=f'极度超买(Z={zscore:.2f})，左侧卖出信号')
+        elif zscore > 2.0:
+            result.update(signal='overbought', score=15,
+                          signal_text=f'超买区(Z={zscore:.2f})，警惕回调')
+        else:
+            result.update(signal='neutral', score=50,
+                          signal_text=f'中性区间(Z={zscore:.2f})')
+    except Exception:
+        pass
+    return result
+
+
+def _find_swing_points(series: pd.Series, order: int = 3) -> list:
+    """找摆动高低点，返回 [(index, value), ...]"""
+    points = []
+    values = series.values
+    for i in range(order, len(values) - order):
+        if all(values[i] <= values[i - j] for j in range(1, order + 1)) and \
+           all(values[i] <= values[i + j] for j in range(1, order + 1)):
+            points.append((i, values[i], 'low'))
+        if all(values[i] >= values[i - j] for j in range(1, order + 1)) and \
+           all(values[i] >= values[i + j] for j in range(1, order + 1)):
+            points.append((i, values[i], 'high'))
+    return points
+
+# PLACEHOLDER_MODULES_CONTINUE
+
+
+def calc_volume_exhaustion(df: pd.DataFrame, lookback: int = 20) -> dict:
+    """量能衰竭分析 — 检测放量滞跌、缩量阴跌、高量节点(HVN)等转折模式。"""
+    result = {
+        'pattern': 'normal', 'pattern_text': '正常',
+        'hvn_zones': [], 'vol_trend': 'flat',
+        'vol_price_divergence': False, 'score': 50, 'details': '无明显量能异常'
+    }
+    try:
+        if len(df) < lookback + 5:
+            return result
+
+        vol_ma20 = df['volume'].rolling(20).mean()
+        recent = df.tail(5).copy()
+        recent_vol = recent['volume'].values
+        recent_close = recent['close'].values
+        last_vol_ma = vol_ma20.iloc[-1]
+
+        if pd.isna(last_vol_ma) or last_vol_ma == 0:
+            return result
+
+        # --- 模式检测 ---
+        last3_vol = recent_vol[-3:]
+        last3_close = recent_close[-3:]
+        total_drop_3d = (last3_close[-1] - last3_close[0]) / last3_close[0] * 100
+
+        # 放量滞跌: 近3日量 > 1.5x MA20 但总跌幅 < 1%
+        if all(v > last_vol_ma * 1.5 for v in last3_vol) and -1.0 < total_drop_3d < 1.0:
+            result.update(pattern='high_vol_stall', pattern_text='放量滞跌',
+                          score=80, details='大量成交但价格不再下跌，空方力竭信号')
+
+        # 缩量阴跌: 连续5日量递减+价格递减
+        elif all(recent_vol[i] < recent_vol[i - 1] for i in range(1, 5)) and \
+             all(recent_close[i] < recent_close[i - 1] for i in range(1, 5)):
+            result.update(pattern='declining_vol_drop', pattern_text='缩量阴跌',
+                          score=60, details='量价齐缩，抛压衰竭中，关注企稳信号')
+
+        # 放量长阴后缩量: 某日量>2x MA20且跌>3%, 随后缩量
+        else:
+            for i in range(max(0, len(df) - 6), len(df) - 2):
+                vol_i = df['volume'].iloc[i]
+                chg_i = (df['close'].iloc[i] - df['close'].iloc[i - 1]) / df['close'].iloc[i - 1] * 100 if i > 0 else 0
+                if vol_i > last_vol_ma * 2 and chg_i < -3:
+                    after_vols = df['volume'].iloc[i + 1:i + 3]
+                    if len(after_vols) >= 2 and all(v < vol_i for v in after_vols):
+                        result.update(pattern='volume_climax', pattern_text='放量长阴后缩量',
+                                      score=75, details='恐慌性抛售后量能萎缩，可能见底')
+                        break
+
+        # --- 量价背离 ---
+        low_20 = df['close'].tail(20).min()
+        if df['close'].iloc[-1] <= low_20 * 1.005 and df['volume'].iloc[-1] < last_vol_ma:
+            result['vol_price_divergence'] = True
+            if result['score'] < 70:
+                result['score'] = 70
+                result['details'] += '；量价背离(创新低但缩量)'
+
+        # --- 量能趋势 ---
+        vol_10 = df['volume'].tail(10).values
+        if len(vol_10) >= 10:
+            slope = np.polyfit(range(len(vol_10)), vol_10, 1)[0]
+            if slope > last_vol_ma * 0.02:
+                result['vol_trend'] = 'increasing'
+            elif slope < -last_vol_ma * 0.02:
+                result['vol_trend'] = 'decreasing'
+
+        # --- HVN (高量节点) ---
+        hvn_df = df.tail(60) if len(df) >= 60 else df
+        price_min, price_max = hvn_df['low'].min(), hvn_df['high'].max()
+        if price_max > price_min:
+            n_bins = 10
+            bin_size = (price_max - price_min) / n_bins
+            bins = []
+            for b in range(n_bins):
+                lo = price_min + b * bin_size
+                hi = lo + bin_size
+                mask = (hvn_df['close'] >= lo) & (hvn_df['close'] < hi)
+                vol_sum = hvn_df.loc[mask, 'volume'].sum()
+                bins.append((round(lo, 2), round(hi, 2), vol_sum))
+            avg_vol = sum(b[2] for b in bins) / n_bins if n_bins > 0 else 0
+            result['hvn_zones'] = [(lo, hi, round(v / avg_vol, 1))
+                                   for lo, hi, v in bins if avg_vol > 0 and v > avg_vol * 1.5]
+    except Exception:
+        pass
+    return result
+
+
+def calc_volatility_regime(df: pd.DataFrame) -> dict:
+    """波动率收缩/扩张分析 — ATR百分位、布林带挤压、脉冲信号检测。"""
+    result = {
+        'regime': 'normal', 'regime_text': '正常波动',
+        'atr_percentile': 50.0, 'bb_width_percentile': 50.0,
+        'is_squeeze': False, 'is_pulse': False,
+        'score': 50, 'details': ''
+    }
+    try:
+        lookback = min(120, len(df))
+        if lookback < 30:
+            return result
+
+        # ATR 百分位
+        atr_series = df['ATR'].tail(lookback)
+        if atr_series.isna().all():
+            return result
+        atr_pct = atr_series.rank(pct=True).iloc[-1] * 100
+        result['atr_percentile'] = round(atr_pct, 1)
+
+        # BB 宽度百分位
+        bb_width = (df['BB_upper'] - df['BB_lower']) / df['BB_middle']
+        bb_series = bb_width.tail(lookback)
+        if bb_series.isna().all():
+            bb_pct = 50.0
+        else:
+            bb_pct = bb_series.rank(pct=True).iloc[-1] * 100
+        result['bb_width_percentile'] = round(bb_pct, 1)
+
+        # 挤压检测
+        is_squeeze = atr_pct < 20 and bb_pct < 20
+        result['is_squeeze'] = is_squeeze
+
+        # 脉冲检测: 当前ATR百分位>30 且 前5日均ATR百分位<20
+        atr_pct_series = atr_series.rank(pct=True) * 100
+        prev5_avg = atr_pct_series.iloc[-6:-1].mean() if len(atr_pct_series) >= 6 else 50
+        is_pulse = atr_pct > 30 and prev5_avg < 20
+        result['is_pulse'] = is_pulse
+
+        close = df['close'].iloc[-1]
+        bb_lower = df['BB_lower'].iloc[-1] if 'BB_lower' in df.columns else None
+
+        if is_pulse:
+            # 脉冲方向
+            price_dir = df['close'].iloc[-1] > df['close'].iloc[-3] if len(df) >= 3 else True
+            if price_dir:
+                result.update(regime='pulse', regime_text='脉冲信号(收缩后向上扩张)',
+                              score=85, details='波动率极低后首次放大，方向向上，左侧入场信号')
+            else:
+                result.update(regime='pulse', regime_text='脉冲信号(收缩后向下扩张)',
+                              score=30, details='波动率极低后首次放大，方向向下，警惕破位')
+        elif is_squeeze:
+            near_lower = bb_lower is not None and not pd.isna(bb_lower) and close < bb_lower * 1.02
+            if near_lower:
+                result.update(regime='squeeze', regime_text='布林带挤压(价格靠近下轨)',
+                              score=75, details='波动率极低+价格靠近下轨，蓄势待发')
+            else:
+                result.update(regime='squeeze', regime_text='布林带挤压',
+                              score=60, details='波动率极低，等待方向选择')
+        elif atr_pct > 80:
+            result.update(regime='expansion', regime_text='高波动扩张',
+                          score=50, details='波动率处于高位，趋势可能延续')
+    except Exception:
+        pass
+    return result
+
+
+# PLACEHOLDER_SR_AND_DIVERGENCE
+
+
+def find_support_resistance_institutional(df: pd.DataFrame) -> dict:
+    """机构级支撑压力位分析 — Order Block、FVG、流动性扫荡检测。"""
+    # 传统S/R作为基线
+    recent = df.tail(20)
+    support_levels = sorted(set(round(v, 2) for v in recent['low'].nsmallest(3)))[:2]
+    resistance_levels = sorted(set(round(v, 2) for v in recent['high'].nlargest(3)), reverse=True)[:2]
+
+    result = {
+        'support': support_levels, 'resistance': resistance_levels,
+        'order_blocks': [], 'fvg_zones': [], 'liquidity_sweeps': [],
+        'score': 50, 'signal_text': '传统支撑压力位'
+    }
+    try:
+        current_price = df['close'].iloc[-1]
+        scan_len = min(60, len(df) - 1)
+        scan_df = df.tail(scan_len + 1).reset_index(drop=True)
+
+        # --- Order Blocks ---
+        for i in range(1, len(scan_df) - 1):
+            prev = scan_df.iloc[i - 1]
+            curr = scan_df.iloc[i]
+            nxt = scan_df.iloc[i + 1]
+            # 看多OB: 阴线后紧跟强阳线(收盘>阴线开盘)
+            if curr['close'] < curr['open'] and nxt['close'] > curr['open'] and nxt['close'] > nxt['open']:
+                result['order_blocks'].append({
+                    'type': 'bullish', 'price_low': round(curr['low'], 2),
+                    'price_high': round(curr['high'], 2),
+                    'strength': round(abs(nxt['close'] - nxt['open']) / max(abs(curr['close'] - curr['open']), 0.01), 1)
+                })
+            # 看空OB: 阳线后紧跟强阴线(收盘<阳线开盘)
+            if curr['close'] > curr['open'] and nxt['close'] < curr['open'] and nxt['close'] < nxt['open']:
+                result['order_blocks'].append({
+                    'type': 'bearish', 'price_low': round(curr['low'], 2),
+                    'price_high': round(curr['high'], 2),
+                    'strength': round(abs(nxt['open'] - nxt['close']) / max(abs(curr['close'] - curr['open']), 0.01), 1)
+                })
+        # 只保留最近5个
+        result['order_blocks'] = result['order_blocks'][-5:]
+
+        # --- FVG (公允价值缺口) ---
+        for i in range(len(scan_df) - 2):
+            c0 = scan_df.iloc[i]
+            c2 = scan_df.iloc[i + 2]
+            # 看多FVG: 向上跳空
+            if c2['low'] > c0['high']:
+                filled = current_price <= c2['low'] and current_price >= c0['high']
+                result['fvg_zones'].append({
+                    'type': 'bullish', 'top': round(c2['low'], 2),
+                    'bottom': round(c0['high'], 2), 'filled': filled
+                })
+            # 看空FVG: 向下跳空
+            if c2['high'] < c0['low']:
+                filled = current_price >= c2['high'] and current_price <= c0['low']
+                result['fvg_zones'].append({
+                    'type': 'bearish', 'top': round(c0['low'], 2),
+                    'bottom': round(c2['high'], 2), 'filled': filled
+                })
+        result['fvg_zones'] = result['fvg_zones'][-5:]
+
+        # --- Liquidity Sweep (假破位) ---
+        for i in range(20, len(scan_df) - 2):
+            low_20 = scan_df['low'].iloc[i - 20:i].min()
+            high_20 = scan_df['high'].iloc[i - 20:i].max()
+            curr = scan_df.iloc[i]
+            # 扫底: 跌破20日低点后2日内收回
+            if curr['low'] < low_20:
+                for j in range(1, min(3, len(scan_df) - i)):
+                    if scan_df['close'].iloc[i + j] > low_20:
+                        result['liquidity_sweeps'].append({
+                            'type': 'sweep_low', 'price': round(low_20, 2),
+                            'recovered': True,
+                            'date': str(scan_df['date'].iloc[i]) if 'date' in scan_df.columns else ''
+                        })
+                        break
+            # 扫顶: 突破20日高点后2日内收回
+            if curr['high'] > high_20:
+                for j in range(1, min(3, len(scan_df) - i)):
+                    if scan_df['close'].iloc[i + j] < high_20:
+                        result['liquidity_sweeps'].append({
+                            'type': 'sweep_high', 'price': round(high_20, 2),
+                            'recovered': True,
+                            'date': str(scan_df['date'].iloc[i]) if 'date' in scan_df.columns else ''
+                        })
+                        break
+        result['liquidity_sweeps'] = result['liquidity_sweeps'][-5:]
+
+        # --- 评分 ---
+        score = 50
+        # 价格在看多OB区间
+        for ob in result['order_blocks']:
+            if ob['type'] == 'bullish' and ob['price_low'] <= current_price <= ob['price_high']:
+                score += 25
+                break
+        # 近期未回补看多FVG
+        for fvg in result['fvg_zones']:
+            if fvg['type'] == 'bullish' and not fvg['filled'] and fvg['bottom'] <= current_price:
+                score += 20
+                break
+        # 近期扫底
+        recent_sweeps = [s for s in result['liquidity_sweeps']
+                         if s['type'] == 'sweep_low' and s['recovered']]
+        if recent_sweeps:
+            score += 30
+        result['score'] = min(100, max(0, score))
+
+        if score >= 80:
+            result['signal_text'] = '强机构级支撑(OB+FVG+假破位共振)'
+        elif score >= 65:
+            result['signal_text'] = '机构级支撑信号'
+        elif score <= 30:
+            result['signal_text'] = '机构级压力区'
+        else:
+            result['signal_text'] = '传统支撑压力位'
+    except Exception:
+        pass
+    return result
+
+
+def calc_triple_divergence(df: pd.DataFrame, lookback: int = 30) -> dict:
+    """三重背离检测 — RSI、OBV、MACD柱状图与价格的背离。"""
+    result = {
+        'rsi_divergence': 'none', 'obv_divergence': 'none', 'macd_divergence': 'none',
+        'rsi_divergence_text': '无', 'obv_divergence_text': '无', 'macd_divergence_text': '无',
+        'divergence_count': 0, 'bearish_div_count': 0,
+        'signal': 'none', 'signal_text': '无背离信号',
+        'score': 50, 'details': []
+    }
+    try:
+        if len(df) < lookback + 5:
+            return result
+
+        tail = df.tail(lookback).reset_index(drop=True)
+        close = tail['close']
+
+        # 找摆动低点和高点
+        swing_points = _find_swing_points(close, order=2)
+        lows = [(i, v) for i, v, t in swing_points if t == 'low']
+        highs = [(i, v) for i, v, t in swing_points if t == 'high']
+
+        def _check_bullish_div(indicator_series, lows_list):
+            """检查看多背离: 价格更低低点 + 指标更高低点"""
+            if len(lows_list) < 2:
+                return 'none'
+            i1, p1 = lows_list[-2]
+            i2, p2 = lows_list[-1]
+            ind1 = indicator_series.iloc[i1]
+            ind2 = indicator_series.iloc[i2]
+            if pd.isna(ind1) or pd.isna(ind2):
+                return 'none'
+            if p2 < p1 and ind2 > ind1:
+                return 'bullish'
+            return 'none'
+
+        def _check_bearish_div(indicator_series, highs_list):
+            """检查看空背离: 价格更高高点 + 指标更低高点"""
+            if len(highs_list) < 2:
+                return 'none'
+            i1, p1 = highs_list[-2]
+            i2, p2 = highs_list[-1]
+            ind1 = indicator_series.iloc[i1]
+            ind2 = indicator_series.iloc[i2]
+            if pd.isna(ind1) or pd.isna(ind2):
+                return 'none'
+            if p2 > p1 and ind2 < ind1:
+                return 'bearish'
+            return 'none'
+
+        indicators_map = {
+            'rsi': tail['RSI'] if 'RSI' in tail.columns else None,
+            'obv': tail['OBV'] if 'OBV' in tail.columns else None,
+            'macd': tail['MACD_hist'] if 'MACD_hist' in tail.columns else None,
+        }
+
+        bullish_count = 0
+        bearish_count = 0
+        text_map = {'rsi': 'RSI', 'obv': 'OBV', 'macd': 'MACD柱'}
+
+        for key, series in indicators_map.items():
+            if series is None or series.isna().all():
+                continue
+            bull = _check_bullish_div(series, lows)
+            bear = _check_bearish_div(series, highs)
+            if bull == 'bullish':
+                result[f'{key}_divergence'] = 'bullish'
+                result[f'{key}_divergence_text'] = f'{text_map[key]}看多背离 ▲'
+                result['details'].append(f'{text_map[key]}: 价格创新低但{text_map[key]}未创新低')
+                bullish_count += 1
+            elif bear == 'bearish':
+                result[f'{key}_divergence'] = 'bearish'
+                result[f'{key}_divergence_text'] = f'{text_map[key]}看空背离 ▼'
+                result['details'].append(f'{text_map[key]}: 价格创新高但{text_map[key]}未创新高')
+                bearish_count += 1
+
+        result['divergence_count'] = bullish_count
+        result['bearish_div_count'] = bearish_count
+
+        # 综合信号
+        if bullish_count >= 3:
+            result.update(signal='triple_bullish', score=95,
+                          signal_text=f'三重看多背离(RSI+OBV+MACD)')
+        elif bullish_count == 2:
+            result.update(signal='double_bullish', score=80,
+                          signal_text=f'双重看多背离')
+        elif bullish_count == 1:
+            result.update(signal='single_bullish', score=65,
+                          signal_text=f'单一看多背离')
+        elif bearish_count >= 3:
+            result.update(signal='triple_bearish', score=5,
+                          signal_text=f'三重看空背离(RSI+OBV+MACD)')
+        elif bearish_count == 2:
+            result.update(signal='double_bearish', score=15,
+                          signal_text=f'双重看空背离')
+        elif bearish_count == 1:
+            result.update(signal='single_bearish', score=35,
+                          signal_text=f'单一看空背离')
+    except Exception:
+        pass
+    return result
+
+
+def generate_contrarian_caveats(contrarian: dict, df: pd.DataFrame) -> list:
+    """检测左侧指标可能失效的场景，生成风险警告。"""
+    caveats = []
+    try:
+        # ATR持续扩张 + 价格持续下跌
+        vr = contrarian.get('volatility_regime', {})
+        if vr.get('atr_percentile', 50) > 90:
+            recent_chg = (df['close'].iloc[-1] - df['close'].iloc[-5]) / df['close'].iloc[-5] * 100 if len(df) >= 5 else 0
+            if recent_chg < -5:
+                caveats.append('⚠ 趋势性下跌中(ATR>90%+近5日跌>5%)，均值回归可能失效')
+
+        # 连续大跌
+        if len(df) >= 5:
+            big_drops = sum(1 for i in range(-5, 0)
+                           if (df['close'].iloc[i] - df['close'].iloc[i - 1]) / df['close'].iloc[i - 1] * 100 < -5)
+            if big_drops >= 3:
+                caveats.append('⚠ 恐慌性抛售(近5日有3日跌幅>5%)，左侧抄底风险极高')
+
+        # Z-Score极端恶化
+        zs = contrarian.get('zscore', {})
+        if zs.get('sufficient_data') and zs.get('zscore', 0) < -3.0:
+            caveats.append('⚠ Z-Score极端偏离(<-3.0)，可能反映基本面恶化而非单纯超卖')
+    except Exception:
+        pass
+    return caveats
+
+
+def calc_contrarian_signals(df: pd.DataFrame) -> dict:
+    """左侧交易信号综合分析 — 聚合5个模块，生成综合评分和仓位建议。"""
+    zscore = calc_mean_reversion_zscore(df)
+    vol_exhaust = calc_volume_exhaustion(df)
+    vol_regime = calc_volatility_regime(df)
+    sr_inst = find_support_resistance_institutional(df)
+    divergence = calc_triple_divergence(df)
+
+    # 加权聚合
+    composite = (
+        zscore['score'] * 0.25 +
+        divergence['score'] * 0.25 +
+        vol_exhaust['score'] * 0.20 +
+        vol_regime['score'] * 0.15 +
+        sr_inst['score'] * 0.15
+    )
+    composite = round(composite)
+
+    # 信号判定
+    if composite >= 80:
+        signal = 'strong_contrarian_buy'
+        signal_text = '强烈左侧买入信号'
+    elif composite >= 65:
+        signal = 'contrarian_buy'
+        signal_text = '左侧买入信号'
+    elif composite <= 20:
+        signal = 'contrarian_sell'
+        signal_text = '左侧卖出信号'
+    elif composite <= 35:
+        signal = 'mild_contrarian_sell'
+        signal_text = '偏空，不宜左侧抄底'
+    else:
+        signal = 'neutral'
+        signal_text = '左侧信号中性，暂无明确机会'
+
+    # 仓位建议 (左侧入场、右侧确认)
+    position_advice = {
+        'initial_position': 0, 'confirm_position': 0,
+        'confirm_conditions': [], 'stop_loss': None
+    }
+    if signal == 'strong_contrarian_buy':
+        position_advice.update(
+            initial_position=10, confirm_position=20,
+            confirm_conditions=['MACD金叉', '站上5日线', '放量突破']
+        )
+    elif signal == 'contrarian_buy':
+        position_advice.update(
+            initial_position=5, confirm_position=15,
+            confirm_conditions=['KDJ金叉', '站上10日线']
+        )
+
+    # 止损: 最近支撑位下方 1*ATR
+    try:
+        atr = df['ATR'].iloc[-1]
+        supports = sr_inst.get('support', [])
+        if supports and not pd.isna(atr):
+            position_advice['stop_loss'] = round(min(supports) - atr, 2)
+    except Exception:
+        pass
+
+    # 风险警告
+    result = {
+        'zscore': zscore, 'volume_exhaustion': vol_exhaust,
+        'volatility_regime': vol_regime, 'sr_institutional': sr_inst,
+        'divergence': divergence, 'composite_score': composite,
+        'signal': signal, 'signal_text': signal_text,
+        'position_advice': position_advice
+    }
+    result['caveats'] = generate_contrarian_caveats(result, df)
+    return result
 
 def analyze_trend(df: pd.DataFrame) -> str:
     """分析当前趋势"""
@@ -2505,13 +3096,18 @@ def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False)
     # 分析
     trend = analyze_trend(df)
     signals = detect_signals(df)
-    support, resistance = find_support_resistance(df)
+    sr_data = find_support_resistance_institutional(df)
+    support = sr_data['support']
+    resistance = sr_data['resistance']
 
     # 多指标分析
     indicators = analyze_indicator_signals(df)
     resonance = calculate_resonance(indicators)
     win_rate_info = calculate_win_rate(indicators, resonance, df)
     context = build_optional_context(code, df, demo=demo)
+
+    # 左侧交易信号分析
+    contrarian = calc_contrarian_signals(df)
 
     summary = generate_summary(df, trend, signals, support, resistance, resonance)
 
@@ -2717,11 +3313,89 @@ def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False)
         print(f"  分析师数量: {consensus['analyst_count']}位")
     print(f"  数据来源: 基于{consensus['source']}汇总")
 
+    # ========== 5.5 左侧交易信号 ==========
+    print(f"\n{'='*70}")
+    print(f"  ║           左侧交易信号 (逆势分析)                            ║")
+    print(f"{'='*70}")
+
+    # Z-Score
+    zs = contrarian['zscore']
+    if zs['sufficient_data']:
+        print(f"  均值回归Z-Score: {zs['zscore']:.2f} (偏离MA200: {zs['deviation_pct']:+.1f}%)")
+        print(f"    → {zs['signal_text']}")
+    else:
+        print(f"  均值回归Z-Score: 数据不足(需200日以上)")
+
+    # Triple Divergence
+    div = contrarian['divergence']
+    print(f"\n  三重背离检测:")
+    print(f"    RSI背离: {div['rsi_divergence_text']}")
+    print(f"    OBV背离: {div['obv_divergence_text']}")
+    print(f"    MACD背离: {div['macd_divergence_text']}")
+    print(f"    → {div['signal_text']}")
+
+    # Volume Exhaustion
+    vol = contrarian['volume_exhaustion']
+    print(f"\n  量能衰竭分析:")
+    print(f"    模式: {vol['pattern_text']}")
+    if vol['hvn_zones']:
+        hvn_str = ', '.join(f"{z[0]:.2f}-{z[1]:.2f}" for z in vol['hvn_zones'][:3])
+        print(f"    高量节点: {hvn_str}")
+    print(f"    → {vol['details']}")
+
+    # Volatility Regime
+    vr = contrarian['volatility_regime']
+    print(f"\n  波动率状态:")
+    print(f"    ATR百分位: {vr['atr_percentile']:.0f}% | 布林带宽百分位: {vr['bb_width_percentile']:.0f}%")
+    print(f"    → {vr['regime_text']}")
+
+    # Institutional S/R
+    sr = contrarian['sr_institutional']
+    if sr['order_blocks']:
+        print(f"\n  机构级支撑压力:")
+        for ob in sr['order_blocks'][:3]:
+            ob_type = "看多OB" if ob['type'] == 'bullish' else "看空OB"
+            print(f"    {ob_type}: {ob['price_low']:.2f}-{ob['price_high']:.2f}")
+    if sr['fvg_zones']:
+        for fvg in sr['fvg_zones'][:2]:
+            fvg_type = "看多FVG" if fvg['type'] == 'bullish' else "看空FVG"
+            filled = "(已回补)" if fvg['filled'] else "(未回补)"
+            print(f"    {fvg_type}: {fvg['bottom']:.2f}-{fvg['top']:.2f} {filled}")
+    if sr['liquidity_sweeps']:
+        for ls in sr['liquidity_sweeps'][:2]:
+            ls_type = "扫底" if ls['type'] == 'sweep_low' else "扫顶"
+            recovered = "已收回" if ls['recovered'] else "未收回"
+            print(f"    假破位({ls_type}): {ls['price']:.2f} ({recovered})")
+
+    # Composite Score
+    score = contrarian['composite_score']
+    score_bar = "█" * (score // 5) + "░" * (20 - score // 5)
+    print(f"\n  左侧综合评分: [{score_bar}] {score}分")
+    print(f"  信号: {contrarian['signal_text']}")
+
+    # Position Advice
+    pa = contrarian['position_advice']
+    if pa['initial_position'] > 0:
+        print(f"\n  仓位建议 (左侧入场、右侧确认):")
+        print(f"    第一步: 左侧试探仓 {pa['initial_position']}%")
+        print(f"    第二步: 右侧确认后加仓至 {pa['initial_position'] + pa['confirm_position']}%")
+        print(f"    确认条件: {', '.join(pa['confirm_conditions'])}")
+        if pa.get('stop_loss'):
+            print(f"    止损价: {pa['stop_loss']:.2f}")
+    else:
+        print(f"\n  仓位建议: 暂不建议左侧入场，等待更明确信号")
+
+    # Risk Caveats
+    if contrarian.get('caveats'):
+        print(f"\n  风险警告:")
+        for caveat in contrarian['caveats']:
+            print(f"    {caveat}")
+
     # ========== 6. 买卖点分析 + 检查清单 ==========
     print(f"\n【买卖点分析】")
 
     try:
-        price_targets = calculate_price_targets(df, resonance, consensus, support, resistance)
+        price_targets = calculate_price_targets(df, resonance, consensus, support, resistance, contrarian=contrarian)
         print(f"  建议买入价: {price_targets['buy_price']:.2f}元 ({price_targets.get('buy_reason', '')})")
         print(f"  建议止损价: {price_targets['stop_loss']:.2f}元 ({price_targets.get('stop_reason', '')})")
         print(f"  目标价: {price_targets['target_price']:.2f}元 ({price_targets.get('target_reason', '')})")
@@ -2736,15 +3410,15 @@ def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False)
     # 操作检查清单
     print(f"\n【操作检查清单】")
     try:
-        checklist = generate_checklist(df, resonance, signals, indicators)
+        checklist = generate_checklist(df, resonance, signals, indicators, contrarian=contrarian)
         pass_count = sum(1 for _, passed, _ in checklist if passed)
         for item, passed, reason in checklist:
             status = "✓" if passed else "✗"
             print(f"  [{status}] {item}: {reason}")
-        print(f"\n  通过: {pass_count}/10 项")
-        if pass_count >= 8:
+        print(f"\n  通过: {pass_count}/12 项")
+        if pass_count >= 10:
             print(f"  建议: 可以执行买入")
-        elif pass_count >= 6:
+        elif pass_count >= 8:
             print(f"  建议: 谨慎观望，逢低布局")
         else:
             print(f"  建议: 暂不建议买入")
@@ -2763,7 +3437,8 @@ def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False)
         dashboard = generate_decision_dashboard(resonance, _fund_flow,
                                                 _news_sentiment,
                                                 consensus if consensus else {},
-                                                win_rate_info)
+                                                win_rate_info,
+                                                contrarian=contrarian)
 
         print(f"  一句话结论:")
         print(f"  {dashboard.get('core_conclusion', '综合分析中...')}")
