@@ -1619,6 +1619,33 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
         df['MA200'] = np.nan
         df['MA200_std'] = np.nan
 
+    # ========== 新增右侧确认指标 ==========
+
+    # Break of Structure (BoS) 检测
+    try:
+        df = calc_break_of_structure(df, lookback=20)
+    except Exception:
+        df['bos_signal'] = 0
+        df['bos_level'] = np.nan
+        df['bos_strength'] = 0
+
+    # Change of Character (ChoCh) 检测
+    try:
+        df = calc_change_of_character(df, lookback=20)
+    except Exception:
+        df['choch_signal'] = 0
+        df['choch_strength'] = 0
+        df['choch_trend'] = 'sideways'
+
+    # VWAP 偏离度分析
+    try:
+        df = calc_vwap_deviation(df, window=20)
+    except Exception:
+        df['vwap'] = np.nan
+        df['vwap_std'] = np.nan
+        df['vwap_deviation'] = np.nan
+        df['vwap_signal'] = 'normal'
+
     return df
 
 
@@ -1908,6 +1935,202 @@ def calc_ichimoku(df: pd.DataFrame, tenkan: int = 9, kijun: int = 26, senkou: in
     df['ICH_SSB'] = ((senkou_high + senkou_low) / 2).shift(kijun)
 
     return df
+
+
+def calc_vwap_deviation(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
+    """
+    计算价格相对 VWAP 的偏离度 (基于 20 日滚动窗口)
+
+    VWAP = Σ(Close × Volume) / Σ(Volume) (滚动 20 日)
+    偏离度 = (Close - VWAP) / VWAP_std
+
+    返回:
+    - vwap: 成交量加权平均价 (20 日滚动)
+    - vwap_std: VWAP 标准差
+    - vwap_deviation: 偏离度 (σ)
+    - vwap_signal: 'extreme_high' (>3σ), 'high' (>2σ), 'normal', 'low' (<-2σ), 'extreme_low' (<-3σ)
+    """
+    df = df.copy()
+    df['vwap'] = np.nan
+    df['vwap_std'] = np.nan
+    df['vwap_deviation'] = np.nan
+    df['vwap_signal'] = 'normal'
+
+    try:
+        if len(df) < window + 5:
+            return df
+
+        # 计算滚动 VWAP
+        price_volume = (df['close'] * df['volume']).rolling(window=window).sum()
+        volume_sum = df['volume'].rolling(window=window).sum()
+
+        # 避免除零
+        df['vwap'] = np.where(volume_sum > 0, price_volume / volume_sum, np.nan)
+
+        # 计算 VWAP 标准差 (使用收盘价的滚动标准差作为近似)
+        df['vwap_std'] = df['close'].rolling(window=window).std()
+
+        # 计算偏离度 (σ)
+        df['vwap_deviation'] = np.where(
+            df['vwap_std'] > 0,
+            (df['close'] - df['vwap']) / df['vwap_std'],
+            0
+        )
+
+        # 分类信号
+        def classify_vwap_signal(deviation):
+            if pd.isna(deviation):
+                return 'normal'
+            if deviation > 3:
+                return 'extreme_high'
+            elif deviation > 2:
+                return 'high'
+            elif deviation < -3:
+                return 'extreme_low'
+            elif deviation < -2:
+                return 'low'
+            else:
+                return 'normal'
+
+        df['vwap_signal'] = df['vwap_deviation'].apply(classify_vwap_signal)
+
+    except Exception:
+        pass
+
+    return df
+
+
+def calc_distribution_patterns(df: pd.DataFrame, lookback: int = 20) -> dict:
+    """
+    识别机构派发 (Distribution) 模式
+
+    派发特征:
+    1. 放量滞涨 (Volume Climax): 成交量创新高但价格不涨
+    2. 顶背离 (Bearish Divergence): 价格新高但 RSI/MACD 不创新高
+    3. 破位下跌 (Breakdown): 跌破 MA20 且 MACD 死叉
+
+    返回:
+    - distribution_score: 派发强度 (0-100)
+    - patterns: ['volume_climax', 'bearish_divergence', 'breakdown']
+    - signal: 'strong_distribution' | 'distribution' | 'neutral'
+    - signal_text: 中文描述
+    """
+    result = {
+        'distribution_score': 0,
+        'patterns': [],
+        'signal': 'neutral',
+        'signal_text': '无派发迹象',
+        'details': []
+    }
+
+    try:
+        if len(df) < lookback + 10:
+            return result
+
+        tail = df.tail(lookback + 5)
+        score = 0
+        patterns = []
+        details = []
+
+        # 1. 检测放量滞涨 (Volume Climax)
+        vol_ma20 = tail['volume'].rolling(20).mean()
+        recent_5 = tail.tail(5)
+
+        if len(recent_5) >= 5:
+            recent_vol = recent_5['volume'].values
+            recent_close = recent_5['close'].values
+            last_vol_ma = vol_ma20.iloc[-1]
+
+            if not pd.isna(last_vol_ma) and last_vol_ma > 0:
+                # 成交量创新高
+                vol_surge = any(v > last_vol_ma * 2 for v in recent_vol[-3:])
+
+                # 价格涨幅有限
+                price_change_pct = (recent_close[-1] - recent_close[0]) / recent_close[0] * 100
+
+                if vol_surge and -2 < price_change_pct < 2:
+                    score += 35
+                    patterns.append('volume_climax')
+                    details.append(f'放量滞涨: 成交量激增但价格涨幅仅{price_change_pct:.1f}%')
+
+        # 2. 检测顶背离 (Bearish Divergence)
+        if 'RSI' in tail.columns and 'MACD' in tail.columns:
+            close_series = tail['close'].reset_index(drop=True)
+            rsi_series = tail['RSI'].reset_index(drop=True)
+            macd_series = tail['MACD'].reset_index(drop=True)
+
+            # 找到波段高点
+            swing_points = _find_swing_points(close_series, order=2)
+            highs = [(idx, val) for idx, val, typ in swing_points if typ == 'high']
+
+            if len(highs) >= 2:
+                i1, p1 = highs[-2]
+                i2, p2 = highs[-1]
+
+                # 价格创新高
+                if p2 > p1:
+                    rsi1 = rsi_series.iloc[i1]
+                    rsi2 = rsi_series.iloc[i2]
+                    macd1 = macd_series.iloc[i1]
+                    macd2 = macd_series.iloc[i2]
+
+                    # RSI 或 MACD 未创新高
+                    rsi_div = not pd.isna(rsi1) and not pd.isna(rsi2) and rsi2 < rsi1
+                    macd_div = not pd.isna(macd1) and not pd.isna(macd2) and macd2 < macd1
+
+                    if rsi_div or macd_div:
+                        score += 40
+                        patterns.append('bearish_divergence')
+                        div_type = 'RSI' if rsi_div else 'MACD'
+                        details.append(f'顶背离: 价格新高但{div_type}未创新高')
+
+        # 3. 检测破位下跌 (Breakdown)
+        if 'MA20' in tail.columns and 'MACD' in tail.columns and 'MACD_SIGNAL' in tail.columns:
+            last = tail.iloc[-1]
+            prev = tail.iloc[-2] if len(tail) >= 2 else last
+
+            close = last['close']
+            ma20 = last['MA20']
+            macd = last['MACD']
+            macd_signal = last['MACD_SIGNAL']
+            prev_macd = prev['MACD']
+            prev_macd_signal = prev['MACD_SIGNAL']
+
+            # 跌破 MA20
+            breakdown_ma = not pd.isna(ma20) and close < ma20
+
+            # MACD 死叉
+            macd_death_cross = (
+                not pd.isna(macd) and not pd.isna(macd_signal) and
+                not pd.isna(prev_macd) and not pd.isna(prev_macd_signal) and
+                prev_macd >= prev_macd_signal and macd < macd_signal
+            )
+
+            if breakdown_ma and macd_death_cross:
+                score += 25
+                patterns.append('breakdown')
+                details.append(f'破位下跌: 跌破MA20({ma20:.2f})且MACD死叉')
+
+        # 汇总结果
+        result['distribution_score'] = min(100, score)
+        result['patterns'] = patterns
+
+        if score >= 70:
+            result['signal'] = 'strong_distribution'
+            result['signal_text'] = '强烈派发信号'
+        elif score >= 40:
+            result['signal'] = 'distribution'
+            result['signal_text'] = '派发迹象'
+        else:
+            result['signal'] = 'neutral'
+            result['signal_text'] = '无明显派发'
+
+        result['details'] = details
+
+    except Exception:
+        pass
+
+    return result
 
 
 # ============ 左侧交易模块 (Contrarian / Left-Side Trading) ============
@@ -2251,6 +2474,188 @@ def find_support_resistance_institutional(df: pd.DataFrame) -> dict:
     except Exception:
         pass
     return result
+
+
+def calc_break_of_structure(df: pd.DataFrame, lookback: int = 20) -> pd.DataFrame:
+    """
+    检测市场结构突破 (Break of Structure)
+
+    BoS 定义:
+    - 上升 BoS: 价格突破前一个波段高点 (Higher High)
+    - 下降 BoS: 价格跌破前一个波段低点 (Lower Low)
+
+    参数:
+    - lookback: 20 天 (保守模式)
+
+    返回:
+    - bos_signal: 1 (bullish BoS), -1 (bearish BoS), 0 (no BoS)
+    - bos_level: 突破的关键价位
+    - bos_strength: 突破强度 (0-100)
+    """
+    df = df.copy()
+    df['bos_signal'] = 0
+    df['bos_level'] = np.nan
+    df['bos_strength'] = 0
+
+    try:
+        if len(df) < lookback + 10:
+            return df
+
+        # 计算成交量均线用于确认
+        vol_ma20 = df['volume'].rolling(20).mean()
+
+        # 遍历最近的数据点
+        for i in range(lookback + 5, len(df)):
+            window = df.iloc[i-lookback:i+1]
+            close_series = window['close'].reset_index(drop=True)
+
+            # 找到波段高低点
+            swing_points = _find_swing_points(close_series, order=3)
+            highs = [(idx, val) for idx, val, typ in swing_points if typ == 'high']
+            lows = [(idx, val) for idx, val, typ in swing_points if typ == 'low']
+
+            current_close = df.iloc[i]['close']
+            current_vol = df.iloc[i]['volume']
+            vol_ma = vol_ma20.iloc[i]
+
+            # 检测上升 BoS (突破前一个波段高点)
+            if len(highs) >= 2:
+                prev_high_idx, prev_high_val = highs[-2]
+                last_high_idx, last_high_val = highs[-1]
+
+                # 确认突破: 收盘价站稳 + 成交量放大
+                if current_close > last_high_val and not pd.isna(vol_ma) and vol_ma > 0:
+                    if current_vol > vol_ma:  # 成交量确认
+                        strength = min(100, ((current_close - last_high_val) / last_high_val) * 100 * 10)
+                        df.loc[df.index[i], 'bos_signal'] = 1
+                        df.loc[df.index[i], 'bos_level'] = last_high_val
+                        df.loc[df.index[i], 'bos_strength'] = strength
+
+            # 检测下降 BoS (跌破前一个波段低点)
+            if len(lows) >= 2:
+                prev_low_idx, prev_low_val = lows[-2]
+                last_low_idx, last_low_val = lows[-1]
+
+                # 确认跌破: 收盘价跌破 + 成交量放大
+                if current_close < last_low_val and not pd.isna(vol_ma) and vol_ma > 0:
+                    if current_vol > vol_ma:  # 成交量确认
+                        strength = min(100, ((last_low_val - current_close) / last_low_val) * 100 * 10)
+                        df.loc[df.index[i], 'bos_signal'] = -1
+                        df.loc[df.index[i], 'bos_level'] = last_low_val
+                        df.loc[df.index[i], 'bos_strength'] = strength
+
+    except Exception:
+        pass
+
+    return df
+
+
+def calc_change_of_character(df: pd.DataFrame, lookback: int = 20) -> pd.DataFrame:
+    """
+    检测趋势性质改变 (Change of Character)
+
+    ChoCh 定义:
+    - 上升趋势中出现 Lower Low (LL) → 可能转为下降趋势
+    - 下降趋势中出现 Higher High (HH) → 可能转为上升趋势
+
+    参数:
+    - lookback: 20 天 (保守模式)
+
+    返回:
+    - choch_signal: 1 (bullish ChoCh), -1 (bearish ChoCh), 0 (no ChoCh)
+    - choch_strength: 信号强度 (0-100)
+    - choch_trend: 当前趋势 ('uptrend', 'downtrend', 'sideways')
+    """
+    df = df.copy()
+    df['choch_signal'] = 0
+    df['choch_strength'] = 0
+    df['choch_trend'] = 'sideways'
+
+    try:
+        if len(df) < lookback + 10:
+            return df
+
+        # 计算 ADX 和 MA 用于趋势识别
+        if 'ADX' not in df.columns or 'MA5' not in df.columns or 'MA20' not in df.columns:
+            return df
+
+        # 计算成交量均线用于确认
+        vol_ma20 = df['volume'].rolling(20).mean()
+
+        # 计算 ATR 用于标准化强度
+        if 'ATR' not in df.columns:
+            return df
+
+        # 遍历最近的数据点
+        for i in range(lookback + 5, len(df)):
+            window = df.iloc[i-lookback:i+1]
+            close_series = window['close'].reset_index(drop=True)
+
+            # 识别当前趋势
+            adx = df.iloc[i]['ADX']
+            ma5 = df.iloc[i]['MA5']
+            ma20 = df.iloc[i]['MA20']
+
+            if pd.isna(adx) or pd.isna(ma5) or pd.isna(ma20):
+                continue
+
+            trend = 'sideways'
+            if adx > 25:
+                if ma5 > ma20:
+                    trend = 'uptrend'
+                elif ma5 < ma20:
+                    trend = 'downtrend'
+
+            df.loc[df.index[i], 'choch_trend'] = trend
+
+            # 找到波段高低点
+            swing_points = _find_swing_points(close_series, order=3)
+            highs = [(idx, val) for idx, val, typ in swing_points if typ == 'high']
+            lows = [(idx, val) for idx, val, typ in swing_points if typ == 'low']
+
+            current_vol = df.iloc[i]['volume']
+            vol_ma = vol_ma20.iloc[i]
+            atr = df.iloc[i]['ATR']
+
+            if pd.isna(vol_ma) or pd.isna(atr) or vol_ma == 0 or atr == 0:
+                continue
+
+            # 上升趋势中检测 Lower Low (看空 ChoCh)
+            if trend == 'uptrend' and len(lows) >= 2:
+                prev_low_idx, prev_low_val = lows[-2]
+                last_low_idx, last_low_val = lows[-1]
+
+                # Lower Low 形成
+                if last_low_val < prev_low_val:
+                    # 计算强度 (相对 ATR 标准化)
+                    ll_magnitude = (prev_low_val - last_low_val) / atr
+                    strength = min(100, ll_magnitude * 100)
+
+                    # 成交量确认
+                    if current_vol > vol_ma and strength > 50:
+                        df.loc[df.index[i], 'choch_signal'] = -1
+                        df.loc[df.index[i], 'choch_strength'] = strength
+
+            # 下降趋势中检测 Higher High (看多 ChoCh)
+            if trend == 'downtrend' and len(highs) >= 2:
+                prev_high_idx, prev_high_val = highs[-2]
+                last_high_idx, last_high_val = highs[-1]
+
+                # Higher High 形成
+                if last_high_val > prev_high_val:
+                    # 计算强度 (相对 ATR 标准化)
+                    hh_magnitude = (last_high_val - prev_high_val) / atr
+                    strength = min(100, hh_magnitude * 100)
+
+                    # 成交量确认
+                    if current_vol > vol_ma and strength > 50:
+                        df.loc[df.index[i], 'choch_signal'] = 1
+                        df.loc[df.index[i], 'choch_strength'] = strength
+
+    except Exception:
+        pass
+
+    return df
 
 
 def calc_triple_divergence(df: pd.DataFrame, lookback: int = 30) -> dict:
@@ -3077,7 +3482,7 @@ def build_optional_context(code: str, df: pd.DataFrame, demo: bool = False) -> d
     return context
 
 
-def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False):
+def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False, stress_test: bool = False):
     """打印分析结果（表格格式）
 
     输出顺序：大盘复盘 → 指标表格 → 筹码/资金流 → 新闻情绪 → 买卖点+清单 → 决策仪表盘 → 综合结论
@@ -3391,6 +3796,173 @@ def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False)
         for caveat in contrarian['caveats']:
             print(f"    {caveat}")
 
+    # ========== 5.6 右侧确认信号 (BoS & ChoCh) ==========
+    print(f"\n{'='*70}")
+    print(f"  ║           右侧确认信号 (趋势跟随)                            ║")
+    print(f"{'='*70}")
+
+    # Break of Structure (BoS)
+    bos_signal = last.get('bos_signal', 0)
+    bos_level = last.get('bos_level', np.nan)
+    bos_strength = last.get('bos_strength', 0)
+
+    print(f"\n  Break of Structure (BoS):")
+    if bos_signal == 1:
+        print(f"    状态: 看多突破 ✓")
+        print(f"    突破价位: {bos_level:.2f}")
+        print(f"    突破强度: {bos_strength:.1f}/100")
+        print(f"    → 价格突破前一个波段高点，右侧确认信号")
+    elif bos_signal == -1:
+        print(f"    状态: 看空突破 ✗")
+        print(f"    突破价位: {bos_level:.2f}")
+        print(f"    突破强度: {bos_strength:.1f}/100")
+        print(f"    → 价格跌破前一个波段低点，趋势转弱")
+    else:
+        print(f"    状态: 无突破")
+        print(f"    → 价格未突破关键波段高低点")
+
+    # Change of Character (ChoCh)
+    choch_signal = last.get('choch_signal', 0)
+    choch_strength = last.get('choch_strength', 0)
+    choch_trend = last.get('choch_trend', 'sideways')
+
+    print(f"\n  Change of Character (ChoCh):")
+    print(f"    当前趋势: {choch_trend}")
+    if choch_signal == 1:
+        print(f"    状态: 看多转折 ✓")
+        print(f"    转折强度: {choch_strength:.1f}/100")
+        print(f"    → 下降趋势中出现 Higher High，可能转为上升趋势")
+    elif choch_signal == -1:
+        print(f"    状态: 看空转折 ✗")
+        print(f"    转折强度: {choch_strength:.1f}/100")
+        print(f"    → 上升趋势中出现 Lower Low，可能转为下降趋势")
+    else:
+        print(f"    状态: 无转折")
+        print(f"    → 趋势性质未改变")
+
+    # ChoCh 检测逻辑伪代码
+    print(f"\n  ChoCh 检测逻辑 (Python 伪代码):")
+    print(f"    1. 识别当前趋势:")
+    print(f"       IF ADX > 25 AND MA5 > MA20 THEN trend = 'uptrend'")
+    print(f"       ELIF ADX > 25 AND MA5 < MA20 THEN trend = 'downtrend'")
+    print(f"       ELSE trend = 'sideways'")
+    print(f"")
+    print(f"    2. 检测反向 swing point:")
+    print(f"       IF trend == 'uptrend' AND 出现 Lower Low THEN")
+    print(f"           choch_signal = 'bearish'")
+    print(f"           choch_strength = (LL 幅度 / ATR) × 100")
+    print(f"")
+    print(f"       IF trend == 'downtrend' AND 出现 Higher High THEN")
+    print(f"           choch_signal = 'bullish'")
+    print(f"           choch_strength = (HH 幅度 / ATR) × 100")
+    print(f"")
+    print(f"    3. 确认信号有效性:")
+    print(f"       IF choch_strength > 50 AND 成交量 > MA20_volume THEN")
+    print(f"           RETURN 'confirmed_choch'")
+    print(f"       ELSE")
+    print(f"           RETURN 'weak_choch'")
+
+    # ========== 5.7 VWAP 偏离度分析 ==========
+    print(f"\n{'='*70}")
+    print(f"  ║           VWAP 偏离度分析 (机构级止盈)                      ║")
+    print(f"{'='*70}")
+
+    vwap = last.get('vwap', np.nan)
+    vwap_deviation = last.get('vwap_deviation', np.nan)
+    vwap_signal = last.get('vwap_signal', 'normal')
+
+    print(f"\n  VWAP (20日滚动): {vwap:.2f}" if not pd.isna(vwap) else "\n  VWAP: 数据不足")
+    print(f"  当前价格: {last['close']:.2f}")
+
+    if not pd.isna(vwap_deviation):
+        print(f"  偏离度: {vwap_deviation:.2f}σ")
+        print(f"  信号: {vwap_signal}")
+
+        if vwap_signal == 'extreme_high':
+            print(f"  → 价格严重偏离 VWAP (>3σ)，建议执行强制减仓")
+        elif vwap_signal == 'high':
+            print(f"  → 价格偏离 VWAP (>2σ)，考虑部分止盈")
+        elif vwap_signal == 'extreme_low':
+            print(f"  → 价格严重低于 VWAP (<-3σ)，可能存在超卖机会")
+        elif vwap_signal == 'low':
+            print(f"  → 价格低于 VWAP (<-2σ)，关注反弹机会")
+        else:
+            print(f"  → 价格在 VWAP 正常区间内")
+    else:
+        print(f"  偏离度: 数据不足")
+
+    # ========== 5.8 高位派发模式识别 ==========
+    print(f"\n{'='*70}")
+    print(f"  ║           高位派发模式识别 (机构退出)                        ║")
+    print(f"{'='*70}")
+
+    distribution = calc_distribution_patterns(df)
+    dist_score = distribution['distribution_score']
+    dist_patterns = distribution['patterns']
+    dist_signal = distribution['signal']
+
+    score_bar = "█" * (dist_score // 5) + "░" * (20 - dist_score // 5)
+    print(f"\n  派发风险评分: [{score_bar}] {dist_score}分")
+    print(f"  信号: {distribution['signal_text']}")
+
+    if dist_patterns:
+        print(f"\n  检测到的派发模式:")
+        for pattern in dist_patterns:
+            if pattern == 'volume_climax':
+                print(f"    ✗ 放量滞涨 (Volume Climax)")
+            elif pattern == 'bearish_divergence':
+                print(f"    ✗ 顶背离 (Bearish Divergence)")
+            elif pattern == 'breakdown':
+                print(f"    ✗ 破位下跌 (Breakdown)")
+
+    if distribution['details']:
+        print(f"\n  详细信息:")
+        for detail in distribution['details']:
+            print(f"    {detail}")
+
+    if dist_score >= 70:
+        print(f"\n  ⚠️  警告: 强烈派发信号，建议减仓或清仓")
+    elif dist_score >= 40:
+        print(f"\n  ⚠️  注意: 出现派发迹象，密切关注")
+
+    # ========== 5.9 压力测试 (如果启用) ==========
+    if stress_test:
+        print(f"\n{'='*70}")
+        print(f"  ║           压力测试 (15% 回撤场景)                            ║")
+        print(f"{'='*70}")
+
+        stress_result = stress_test_drawdown(df, code, drawdown_pct=0.15)
+
+        print(f"\n  当前价格: {last['close']:.2f}")
+        print(f"  回撤后价格 (-15%): {stress_result['scenario_price']:.2f}")
+
+        # VaR 计算
+        if stress_result['var_formula']:
+            print(f"\n  VaR (95% 置信度):")
+            print(f"    公式: {stress_result['var_formula']}")
+            print(f"    VaR₉₅%: {stress_result['var_95']:.4f} ({stress_result['var_95']*100:.2f}%)")
+            print(f"    预期损失: {stress_result['expected_loss']:.4f}")
+
+        # 支撑位
+        if stress_result['support_levels']:
+            print(f"\n  下方支撑位:")
+            for i, support in enumerate(stress_result['support_levels'][:5], 1):
+                distance_pct = (support - stress_result['scenario_price']) / stress_result['scenario_price'] * 100
+                print(f"    S{i}: {support:.2f} (距回撤价 {distance_pct:+.1f}%)")
+        else:
+            print(f"\n  下方支撑位: 无明确支撑")
+
+        # 对冲策略
+        hedge = stress_result['hedge_strategy']
+        print(f"\n  对冲策略建议:")
+        print(f"    行动: {hedge['action']}")
+        print(f"    理由: {hedge['reason']}")
+
+        if hedge['hedge_instruments']:
+            print(f"\n  对冲工具:")
+            for instrument in hedge['hedge_instruments']:
+                print(f"    • {instrument}")
+
     # ========== 6. 买卖点分析 + 检查清单 ==========
     print(f"\n【买卖点分析】")
 
@@ -3502,6 +4074,402 @@ def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False)
     print(f"{'='*70}\n")
 
 
+# ============ 批量分析与压力测试模块 ============
+
+def analyze_portfolio(codes: list, period: str = 'd', days: int = 60, demo: bool = False, stress_test: bool = False) -> dict:
+    """
+    批量分析多只股票
+
+    参数:
+    - codes: 股票代码列表 ['0700.HK', '1810.HK', 'QQQ', 'TSLA', 'NVDA']
+    - period: 周期 ('d' 或 'w')
+    - days: 回溯天数
+    - demo: 是否使用演示数据
+    - stress_test: 是否执行压力测试
+
+    返回:
+    - results: Dict[code, analysis_result]
+    - comparison: 横向对比数据
+    """
+    results = {}
+    print(f"\n开始批量分析 {len(codes)} 只股票...\n")
+
+    for idx, code in enumerate(codes, 1):
+        print(f"[{idx}/{len(codes)}] 正在分析 {code}...")
+        try:
+            # 获取数据
+            df = fetch_stock_data(code, period, days, demo)
+            if df.empty:
+                results[code] = {'error': '无法获取数据'}
+                continue
+
+            # 数据清洗
+            is_valid, error_msg, df_clean = validate_data(df, min_rows=30)
+            if not is_valid:
+                results[code] = {'error': error_msg}
+                continue
+
+            # 计算指标
+            df_clean = calculate_indicators(df_clean)
+
+            # 分析信号
+            signals = detect_signals(df_clean)
+            sr_inst = find_support_resistance_institutional(df_clean)
+            indicators = analyze_indicator_signals(df_clean)
+            resonance = calculate_resonance(indicators)
+            win_rate_info = calculate_win_rate(indicators, resonance, df_clean)
+            contrarian = calc_contrarian_signals(df_clean)
+            distribution = calc_distribution_patterns(df_clean)
+
+            # 价格目标
+            price_targets = calculate_price_targets(
+                df_clean, code, resonance, sr_inst, contrarian, demo
+            )
+
+            # 决策仪表盘
+            optional_ctx = build_optional_context(code, df_clean, demo)
+            dashboard = generate_decision_dashboard(
+                resonance,
+                optional_ctx.get('fund_flow', {}),
+                optional_ctx.get('sentiment', {}),
+                optional_ctx.get('consensus', {}),
+                win_rate_info,
+                contrarian
+            )
+
+            # 压力测试
+            stress_result = None
+            if stress_test:
+                stress_result = stress_test_drawdown(df_clean, code, drawdown_pct=0.15)
+
+            # 汇总结果
+            analysis = {
+                'df': df_clean,
+                'signals': signals,
+                'sr_inst': sr_inst,
+                'indicators': indicators,
+                'resonance': resonance,
+                'win_rate_info': win_rate_info,
+                'contrarian': contrarian,
+                'distribution': distribution,
+                'price_targets': price_targets,
+                'dashboard': dashboard,
+                'optional_ctx': optional_ctx,
+                'stress_result': stress_result
+            }
+            results[code] = analysis
+            print(f"  ✓ {code} 分析完成")
+
+        except Exception as e:
+            results[code] = {'error': str(e)}
+            print(f"  ✗ {code} 分析失败: {e}")
+
+    # 生成横向对比表
+    print("\n生成对比表...")
+    comparison = generate_comparison_table(results)
+
+    return {'results': results, 'comparison': comparison}
+
+
+def generate_comparison_table(results: dict) -> pd.DataFrame:
+    """
+    生成多股票对比表
+
+    列:
+    - 股票代码
+    - 当前阶段
+    - 多头强度
+    - 空头强度
+    - 共振信号
+    - 左侧信号得分
+    - BoS 状态
+    - ChoCh 状态
+    - 派发风险
+    - 建议操作
+    """
+    rows = []
+
+    for code, analysis in results.items():
+        if 'error' in analysis:
+            rows.append({
+                '股票代码': code,
+                '当前阶段': '数据错误',
+                '多头强度': 0,
+                '空头强度': 0,
+                '共振信号': 'N/A',
+                '左侧得分': 0,
+                'BoS状态': 'N/A',
+                'ChoCh状态': 'N/A',
+                '派发风险': 0,
+                '建议操作': '无法分析'
+            })
+            continue
+
+        try:
+            df = analysis['df']
+            resonance = analysis['resonance']
+            contrarian = analysis['contrarian']
+            distribution = analysis['distribution']
+            dashboard = analysis['dashboard']
+
+            # 获取最新数据
+            last = df.iloc[-1]
+
+            # 判断当前阶段
+            stage = determine_market_stage(
+                resonance, contrarian, distribution, last
+            )
+
+            # BoS 状态
+            bos_signal = last.get('bos_signal', 0)
+            if bos_signal == 1:
+                bos_status = '看多突破'
+            elif bos_signal == -1:
+                bos_status = '看空突破'
+            else:
+                bos_status = '无突破'
+
+            # ChoCh 状态
+            choch_signal = last.get('choch_signal', 0)
+            if choch_signal == 1:
+                choch_status = '看多转折'
+            elif choch_signal == -1:
+                choch_status = '看空转折'
+            else:
+                choch_status = '无转折'
+
+            rows.append({
+                '股票代码': code,
+                '当前阶段': stage,
+                '多头强度': dashboard['bullish_score'],
+                '空头强度': dashboard['bearish_score'],
+                '共振信号': resonance['resonance'],
+                '左侧得分': contrarian['composite_score'],
+                'BoS状态': bos_status,
+                'ChoCh状态': choch_status,
+                '派发风险': distribution['distribution_score'],
+                '建议操作': dashboard['action']
+            })
+
+        except Exception as e:
+            rows.append({
+                '股票代码': code,
+                '当前阶段': '解析错误',
+                '多头强度': 0,
+                '空头强度': 0,
+                '共振信号': 'N/A',
+                '左侧得分': 0,
+                'BoS状态': 'N/A',
+                'ChoCh状态': 'N/A',
+                '派发风险': 0,
+                '建议操作': '无法分析'
+            })
+
+    return pd.DataFrame(rows)
+
+
+def determine_market_stage(resonance: dict, contrarian: dict, distribution: dict, last_row) -> str:
+    """
+    判断股票当前所处阶段
+
+    阶段:
+    - 左侧筑底: 左侧信号强 + 共振中性/看多
+    - 右侧启动: BoS 看多 + 共振看多
+    - 高位派发: 派发风险高 + 共振看空
+    - 下行通道: 共振看空 + 无左侧信号
+    """
+    resonance_signal = resonance['resonance']
+    contrarian_score = contrarian['composite_score']
+    distribution_score = distribution['distribution_score']
+    bos_signal = last_row.get('bos_signal', 0)
+
+    # 高位派发
+    if distribution_score >= 60:
+        return '高位派发'
+
+    # 右侧启动
+    if bos_signal == 1 and resonance_signal in ['strong_buy', 'buy']:
+        return '右侧启动'
+
+    # 左侧筑底
+    if contrarian_score >= 65 and resonance_signal in ['neutral', 'buy', 'strong_buy']:
+        return '左侧筑底'
+
+    # 下行通道
+    if resonance_signal in ['sell', 'strong_sell'] and contrarian_score < 50:
+        return '下行通道'
+
+    # 震荡整理
+    return '震荡整理'
+
+
+def stress_test_drawdown(df: pd.DataFrame, code: str, drawdown_pct: float = 0.15) -> dict:
+    """
+    模拟价格下跌 X% 的压力测试
+
+    参数:
+    - df: 股票数据
+    - code: 股票代码
+    - drawdown_pct: 回撤幅度 (默认 15%)
+
+    返回:
+    - scenario_price: 回撤后的价格
+    - support_levels: 下方支撑位列表
+    - hedge_strategy: 对冲策略建议
+    - var_95: 95% 置信度下的 VaR
+    - expected_loss: 预期损失
+    """
+    result = {
+        'scenario_price': 0,
+        'support_levels': [],
+        'hedge_strategy': {},
+        'var_95': 0,
+        'expected_loss': 0,
+        'var_formula': ''
+    }
+
+    try:
+        current_price = df['close'].iloc[-1]
+        scenario_price = current_price * (1 - drawdown_pct)
+        result['scenario_price'] = scenario_price
+
+        # 1. 计算 VaR (使用历史模拟法)
+        returns = df['close'].pct_change().dropna()
+        if len(returns) > 0:
+            var_95_pct = np.percentile(returns, 5)
+            var_95 = var_95_pct * current_price
+            result['var_95'] = var_95
+            result['expected_loss'] = abs(var_95) * drawdown_pct
+
+            # LaTeX 公式 (使用 Unicode 符号)
+            mean_return = returns.mean()
+            std_return = returns.std()
+            result['var_formula'] = f"VaR₉₅% = μ + z₀.₀₅ × σ = {mean_return:.4f} + (-1.645) × {std_return:.4f} = {var_95_pct:.4f}"
+
+        # 2. 找到下方支撑位
+        sr_inst = find_support_resistance_institutional(df)
+        support_levels = sr_inst.get('support', [])
+        result['support_levels'] = [s for s in support_levels if s < current_price]
+
+        # 3. 生成对冲策略
+        result['hedge_strategy'] = generate_hedge_strategy(code, scenario_price, result['support_levels'])
+
+    except Exception:
+        pass
+
+    return result
+
+
+def generate_hedge_strategy(code: str, scenario_price: float, support_levels: list) -> dict:
+    """
+    生成对冲策略建议 (纯文字建议)
+
+    策略:
+    1. 如果 scenario_price 接近支撑位 → 建议"持仓观望，准备补仓"
+    2. 如果 scenario_price 跌破所有支撑位 → 建议"止损离场"
+    3. 如果是 QQQ/NVDA (科技股) → 建议"买入 VIX 看涨期权对冲"
+    4. 如果是港股 (腾讯/小米) → 建议"关注恒生指数走势，考虑做空恒指期货"
+
+    返回:
+    - action: 'hold_and_watch' | 'add_position' | 'stop_loss' | 'hedge_with_options'
+    - reason: 策略理由
+    - hedge_instruments: 对冲工具列表
+    """
+    result = {
+        'action': 'hold_and_watch',
+        'reason': '',
+        'hedge_instruments': []
+    }
+
+    try:
+        # 检查是否接近支撑位
+        near_support = False
+        if support_levels:
+            closest_support = max(support_levels)
+            if abs(scenario_price - closest_support) / closest_support < 0.05:
+                near_support = True
+                result['action'] = 'add_position'
+                result['reason'] = f'回撤后价格({scenario_price:.2f})接近关键支撑位({closest_support:.2f})，可考虑补仓'
+            elif scenario_price < min(support_levels):
+                result['action'] = 'stop_loss'
+                result['reason'] = f'回撤后价格({scenario_price:.2f})跌破所有支撑位，建议止损离场'
+            else:
+                result['action'] = 'hold_and_watch'
+                result['reason'] = f'回撤后价格({scenario_price:.2f})仍在支撑区间内，持仓观望'
+        else:
+            result['action'] = 'hold_and_watch'
+            result['reason'] = '无明确支撑位数据，建议持仓观望'
+
+        # 根据股票类型推荐对冲工具
+        code_upper = code.upper()
+
+        # 美股科技股
+        if code_upper in ['QQQ', 'NVDA', 'TSLA', 'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META']:
+            result['hedge_instruments'].append('买入 VIX 看涨期权 (对冲市场波动风险)')
+            result['hedge_instruments'].append(f'买入 {code_upper} 看跌期权 (直接对冲个股风险)')
+            result['hedge_instruments'].append('做空纳斯达克 100 期货 (NQ) (对冲科技板块风险)')
+
+        # 港股
+        elif '.HK' in code_upper:
+            result['hedge_instruments'].append('关注恒生指数走势，考虑做空恒指期货 (HSI)')
+            result['hedge_instruments'].append('买入恒生指数看跌期权')
+            result['hedge_instruments'].append('配置美元资产对冲港币汇率风险')
+
+        # A股
+        elif code_upper.isdigit() and len(code_upper) == 6:
+            result['hedge_instruments'].append('做空沪深 300 期货 (IF) 或中证 500 期货 (IC)')
+            result['hedge_instruments'].append('买入沪深 300 看跌期权')
+            result['hedge_instruments'].append('配置国债或货币基金降低组合波动')
+
+        else:
+            result['hedge_instruments'].append('根据股票所属市场选择相应的指数期货或期权对冲')
+
+    except Exception:
+        result['reason'] = '对冲策略生成失败'
+
+    return result
+
+
+def print_portfolio_analysis(results: dict):
+    """
+    打印批量分析结果 (完整输出模式)
+
+    输出:
+    1. 多空力量对比表
+    2. 各股票详细分析
+    3. 风险压力测试结果 (如果启用)
+    """
+    print("\n" + "="*80)
+    print("【投资组合分析】")
+    print("="*80)
+
+    # 1. 打印对比表
+    comparison_df = results['comparison']
+    print("\n多空力量对比表:")
+    print(comparison_df.to_string(index=False))
+
+    # 2. 逐个打印详细分析
+    for code, analysis in results['results'].items():
+        if 'error' in analysis:
+            print(f"\n{'='*80}")
+            print(f"【{code}】")
+            print(f"{'='*80}")
+            print(f"分析失败: {analysis['error']}\n")
+            continue
+
+        print(f"\n{'='*80}")
+        print(f"【{code} 详细分析】")
+        print(f"{'='*80}")
+
+        # 复用 print_analysis 的核心逻辑
+        df = analysis['df']
+        print_analysis(
+            df, code, 'd',
+            demo=False,
+            stress_test=(analysis.get('stress_result') is not None)
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='股票K线技术分析工具',
@@ -3516,21 +4484,43 @@ def main():
 
   # 分析腾讯控股
   python stock_analyzer.py 0700.HK -d 60
+
+  # 批量分析多只股票
+  python stock_analyzer.py --portfolio 0700.HK 1810.HK QQQ TSLA NVDA -d 60
+
+  # 执行压力测试
+  python stock_analyzer.py NVDA -d 60 --stress-test
         '''
     )
 
-    parser.add_argument('code', help='股票代码（A股6位数字，美股代码如AAPL）')
+    parser.add_argument('code', nargs='?', help='股票代码（A股6位数字，美股代码如AAPL）')
     parser.add_argument('-p', '--period', choices=['d', 'w'], default='d',
                         help='K线周期：d=日线，w=周线 (默认: d)')
     parser.add_argument('-d', '--days', type=int, default=60,
                         help='分析天数 (默认: 60)')
     parser.add_argument('--demo', action='store_true',
                         help='使用演示数据模式（无需网络）')
+    parser.add_argument('--portfolio', nargs='+',
+                        help='批量分析多只股票 (例: --portfolio 0700.HK 1810.HK QQQ TSLA NVDA)')
+    parser.add_argument('--stress-test', action='store_true',
+                        help='执行 15%% 回撤压力测试')
 
     args = parser.parse_args()
-    args.code = args.code.upper()
 
     try:
+        # 批量分析模式
+        if args.portfolio:
+            codes = [c.upper() for c in args.portfolio]
+            results = analyze_portfolio(codes, args.period, args.days, args.demo, args.stress_test)
+            print_portfolio_analysis(results)
+            return
+
+        # 单股票分析模式
+        if not args.code:
+            parser.error('请提供股票代码或使用 --portfolio 进行批量分析')
+
+        args.code = args.code.upper()
+
         # 验证股票代码格式
         is_valid, error_msg = validate_stock_code(args.code)
         if not is_valid:
@@ -3558,7 +4548,7 @@ def main():
             print(f"提示: 数据量较少（{len(df_clean)}条），结论仅供参考，建议使用 -d 120 获取更多数据")
 
         # 分析并输出
-        print_analysis(df_clean, args.code, args.period, demo=args.demo)
+        print_analysis(df_clean, args.code, args.period, demo=args.demo, stress_test=args.stress_test)
 
     except KeyboardInterrupt:
         print("\n操作已取消")
