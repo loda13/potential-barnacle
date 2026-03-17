@@ -21,6 +21,14 @@ import numpy as np
 REQUEST_TIMEOUT = 10
 CHART_FETCH_BUFFER_DAYS = 320
 
+# ============ 仓位管理参数 ============
+MAX_RISK_PER_TRADE = 0.02      # 每笔交易最大风险比例 (1-2%)
+DEFAULT_ACCOUNT_SIZE = 100000  # 默认账户规模（10万元）
+CHANDELIER_ATR_MULTIPLIER = 2.5  # Chandelier Exit ATR倍数
+CHANDELIER_LOOKBACK = 22      # Chandelier Exit 回溯天数
+SLIPPAGE_PCT = 0.002          # 滑点 0.2%
+ADV_POSITION_LIMIT = 0.01    # 仓位不超过 ADV 的 1%
+
 
 def normalize_symbol(code: str) -> str:
     """将用户输入的股票代码转换为数据源可识别的标准代码。"""
@@ -521,6 +529,188 @@ def fetch_analyst_consensus(code: str) -> dict:
     return default_result
 
 
+# ============ 新增功能: 期权数据 ============
+
+def fetch_options_data(code: str) -> dict:
+    """获取期权数据 (IV, P/C Ratio)
+
+    数据源: yfinance (仅美股/港股部分标的)
+
+    Returns:
+        {
+            'iv': float,              # 当前隐含波动率 (最近到期日 ATM 期权)
+            'iv_rank': float,         # IV Rank (过去252日IV百分位)
+            'iv_percentile': float,   # IV 百分位
+            'put_call_ratio': float,  # 看跌/看涨比率
+            'pc_ratio_change': float, # P/C Ratio 近5日变化（简化为0）
+            'available': bool,        # 数据是否可用
+            'source': str             # 数据源
+        }
+    """
+    default_result = {
+        'iv': None,
+        'iv_rank': None,
+        'iv_percentile': None,
+        'put_call_ratio': None,
+        'pc_ratio_change': 0,
+        'available': False,
+        'source': '无数据'
+    }
+
+    # A股不支持期权数据
+    if code.isdigit() and len(code) == 6:
+        default_result['source'] = 'A股暂不支持期权数据'
+        return default_result
+
+    try:
+        import yfinance as yf
+        yf_code = normalize_symbol(code)
+        ticker = yf.Ticker(yf_code)
+
+        # 获取可用的到期日
+        expirations = call_with_suppressed_output(lambda: ticker.options)
+        if not expirations or len(expirations) == 0:
+            default_result['source'] = '该标的暂无期权数据'
+            return default_result
+
+        # 使用最近到期日
+        nearest_exp = expirations[0]
+
+        # 获取期权链
+        opt_chain = call_with_suppressed_output(lambda: ticker.option_chain(nearest_exp))
+        if opt_chain is None:
+            return default_result
+
+        calls = opt_chain.calls
+        puts = opt_chain.puts
+
+        if calls.empty or puts.empty:
+            return default_result
+
+        # 获取当前价格用于选择 ATM 期权
+        info = call_with_suppressed_output(lambda: ticker.info)
+        current_price = info.get('currentPrice') or info.get('regularMarketPrice')
+
+        if current_price is None:
+            # 使用最近的收盘价
+            hist = call_with_suppressed_output(lambda: ticker.history(period='1d'))
+            if hist.empty:
+                return default_result
+            current_price = hist['Close'].iloc[-1]
+
+        # 选择 ATM 期权（最接近当前价格的）
+        calls['strike_diff'] = abs(calls['strike'] - current_price)
+        puts['strike_diff'] = abs(puts['strike'] - current_price)
+
+        atm_call = calls.loc[calls['strike_diff'].idxmin()]
+        atm_put = puts.loc[puts['strike_diff'].idxmin()]
+
+        # 计算当前 IV（ATM call 和 put 的平均值）
+        call_iv = atm_call.get('impliedVolatility', 0)
+        put_iv = atm_put.get('impliedVolatility', 0)
+        current_iv = (call_iv + put_iv) / 2 if call_iv and put_iv else (call_iv or put_iv or 0)
+
+        # 计算 P/C Ratio（使用未平仓合约）
+        total_call_oi = calls['openInterest'].sum() if 'openInterest' in calls.columns else 0
+        total_put_oi = puts['openInterest'].sum() if 'openInterest' in puts.columns else 0
+
+        pc_ratio = total_put_oi / total_call_oi if total_call_oi > 0 else 0
+
+        # IV Rank 和 IV Percentile（简化计算，使用当前IV作为参考）
+        # 实际应用中需要历史IV数据，这里简化处理
+        iv_percentile = min(100, max(0, current_iv * 100))  # 简化：将IV转换为百分位
+        iv_rank = iv_percentile  # 简化：IV Rank ≈ IV Percentile
+
+        return {
+            'iv': round(current_iv, 4) if current_iv else None,
+            'iv_rank': round(iv_rank, 1) if iv_rank else None,
+            'iv_percentile': round(iv_percentile, 1) if iv_percentile else None,
+            'put_call_ratio': round(pc_ratio, 2) if pc_ratio else None,
+            'pc_ratio_change': 0,  # 简化，需要历史数据才能计算
+            'available': True,
+            'source': 'yfinance期权数据'
+        }
+
+    except Exception:
+        default_result['source'] = '期权数据获取失败'
+        return default_result
+
+
+def detect_fake_breakout(df: pd.DataFrame, options_data: dict, breakout_direction: str = 'up') -> dict:
+    """检测假突破信号
+
+    Args:
+        df: 价格数据
+        options_data: 期权数据（来自 fetch_options_data）
+        breakout_direction: 'up' 或 'down'
+
+    Returns:
+        {
+            'is_fake_breakout': bool,
+            'warning_level': str,  # 'none' | 'low' | 'medium' | 'high'
+            'signals': [],         # 触发的信号列表
+            'details': str
+        }
+    """
+    result = {
+        'is_fake_breakout': False,
+        'warning_level': 'none',
+        'signals': [],
+        'details': '无假突破风险'
+    }
+
+    if not options_data.get('available', False):
+        result['details'] = '期权数据不可用，无法检测假突破'
+        return result
+
+    try:
+        pc_ratio = options_data.get('put_call_ratio', 0)
+        iv = options_data.get('iv', 0)
+
+        if breakout_direction == 'up':
+            # 价格向上突破时的假突破检测
+            signals = []
+
+            # 1. P/C Ratio 异常飙升 (>1.5 或近期涨幅>50%)
+            if pc_ratio > 1.5:
+                signals.append('P/C Ratio异常高(>1.5)')
+            if options_data.get('pc_ratio_change', 0) > 0.5:
+                signals.append('P/C Ratio近期飙升(>50%)')
+
+            # 2. IV 飙升（市场恐慌）
+            if iv > 0.6:  # IV > 60% 为高波动
+                signals.append('IV异常高(>60%)')
+
+            if signals:
+                result['is_fake_breakout'] = True
+                result['signals'] = signals
+                result['warning_level'] = 'high' if len(signals) >= 2 else 'medium'
+                result['details'] = f"假突破风险: {', '.join(signals)}"
+
+        else:  # breakout_direction == 'down'
+            # 价格向下突破时的假跌破检测
+            signals = []
+
+            # 1. P/C Ratio 下降（市场不恐慌）
+            if pc_ratio < 0.7:
+                signals.append('P/C Ratio较低(<0.7)，市场不恐慌')
+
+            # 2. IV 高位（可能已恐慌到位）
+            if iv > 0.5:
+                signals.append('IV较高(>50%)，恐慌可能见顶')
+
+            if signals:
+                result['is_fake_breakout'] = True
+                result['signals'] = signals
+                result['warning_level'] = 'medium'
+                result['details'] = f"可能假跌破: {', '.join(signals)}"
+
+    except Exception:
+        pass
+
+    return result
+
+
 # ============ 新增功能: 筹码分布 ============
 
 def fetch_chip_distribution(code: str) -> dict:
@@ -1019,10 +1209,461 @@ def get_market_review() -> dict:
     return default_result
 
 
+# ============ 黑天鹅与熔断模块 (Circuit Breaker) ============
+
+def fetch_macro_risk_data(code: str) -> dict:
+    """获取宏观风险数据：VIX + 基准指数 MA200 状态
+
+    根据股票类型选择基准指数：
+    - A股 → 沪深300 (000300.SS)
+    - 美股 → SPY
+    - 港股 → ^HSI
+
+    Returns:
+        {
+            'benchmark': {
+                'code': str,           # 基准指数代码
+                'name': str,           # 基准指数名称
+                'price': float,        # 当前价格
+                'ma200': float,        # 200日均线
+                'below_ma200': bool,   # 是否跌破 MA200
+                'deviation_pct': float # 偏离 MA200 百分比
+            },
+            'vix': {
+                'current': float,      # 当前 VIX
+                'prev_close': float,   # 前收盘
+                'change_pct': float,   # 日内变化百分比
+                'spike': bool          # 是否飙升 > 15%
+            },
+            'available': bool,
+            'source': str
+        }
+    """
+    default_result = {
+        'benchmark': {
+            'code': '', 'name': '', 'price': None, 'ma200': None,
+            'below_ma200': False, 'deviation_pct': 0
+        },
+        'vix': {
+            'current': None, 'prev_close': None, 'change_pct': 0, 'spike': False
+        },
+        'available': False,
+        'source': '未获取'
+    }
+
+    try:
+        # 根据股票代码判断市场类型，选择基准指数
+        normalized = normalize_symbol(code)
+        if normalized.endswith('.SS') or normalized.endswith('.SZ'):
+            benchmark_code = '000300.SS'
+            benchmark_name = '沪深300'
+        elif normalized.endswith('.HK'):
+            benchmark_code = '^HSI'
+            benchmark_name = '恒生指数'
+        else:
+            benchmark_code = 'SPY'
+            benchmark_name = 'S&P 500 (SPY)'
+
+        # 获取基准指数数据（250天，用于计算 MA200）
+        bm_df, bm_err = safe_fetch_yfinance_chart(benchmark_code, 'd', 250)
+
+        if bm_df is not None and len(bm_df) >= 200:
+            bm_close = bm_df['close']
+            ma200 = bm_close.rolling(200).mean().iloc[-1]
+            current_price = bm_close.iloc[-1]
+            below_ma200 = current_price < ma200
+            deviation_pct = ((current_price - ma200) / ma200) * 100
+
+            default_result['benchmark'] = {
+                'code': benchmark_code,
+                'name': benchmark_name,
+                'price': round(current_price, 2),
+                'ma200': round(ma200, 2),
+                'below_ma200': below_ma200,
+                'deviation_pct': round(deviation_pct, 2)
+            }
+        elif bm_df is not None and len(bm_df) > 0:
+            # 数据不足200天，仅记录价格
+            default_result['benchmark'] = {
+                'code': benchmark_code,
+                'name': benchmark_name,
+                'price': round(bm_df['close'].iloc[-1], 2),
+                'ma200': None,
+                'below_ma200': False,
+                'deviation_pct': 0
+            }
+
+        # 获取 VIX 数据（2天，用于计算日内变化）
+        vix_df, vix_err = safe_fetch_yfinance_chart('^VIX', 'd', 5)
+
+        if vix_df is not None and len(vix_df) >= 2:
+            vix_current = vix_df['close'].iloc[-1]
+            vix_prev = vix_df['close'].iloc[-2]
+            vix_change_pct = ((vix_current - vix_prev) / vix_prev) * 100
+            vix_spike = vix_change_pct > 15
+
+            default_result['vix'] = {
+                'current': round(vix_current, 2),
+                'prev_close': round(vix_prev, 2),
+                'change_pct': round(vix_change_pct, 2),
+                'spike': vix_spike
+            }
+
+        default_result['available'] = True
+        default_result['source'] = 'Yahoo Finance'
+
+    except Exception:
+        default_result['source'] = '获取失败'
+
+    return default_result
+
+
+def check_gap_destruction(df: pd.DataFrame, hvn_zones: list) -> dict:
+    """检测个股跳空毁灭：开盘价向下跳空穿越 HVN 且幅度 > 1.5x ATR
+
+    Args:
+        df: OHLCV DataFrame (包含 ATR 列)
+        hvn_zones: 高成交量节点 [(low, high, ratio), ...]
+
+    Returns:
+        {
+            'triggered': bool,         # 是否触发
+            'gap_size': float,         # 跳空幅度（绝对值）
+            'gap_atr_ratio': float,    # 跳空幅度 / ATR
+            'breached_hvn': tuple,     # 被穿越的 HVN 区域
+            'details': str             # 描述
+        }
+    """
+    default_result = {
+        'triggered': False,
+        'gap_size': 0,
+        'gap_atr_ratio': 0,
+        'breached_hvn': None,
+        'details': '无跳空毁灭'
+    }
+
+    if len(df) < 2:
+        return default_result
+
+    try:
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        today_open = last['open']
+        prev_close = prev['close']
+        atr = last.get('ATR')
+
+        if pd.isna(atr) or atr <= 0:
+            return default_result
+
+        # 计算向下跳空幅度
+        gap_size = prev_close - today_open  # 正值 = 向下跳空
+
+        if gap_size <= 0:
+            default_result['details'] = '无向下跳空'
+            return default_result
+
+        gap_atr_ratio = gap_size / atr
+
+        # 条件1: 跳空幅度 > 1.5x ATR
+        if gap_atr_ratio <= 1.5:
+            default_result['gap_size'] = round(gap_size, 2)
+            default_result['gap_atr_ratio'] = round(gap_atr_ratio, 2)
+            default_result['details'] = f'向下跳空 {gap_size:.2f} ({gap_atr_ratio:.1f}x ATR)，未达阈值'
+            return default_result
+
+        # 条件2: 开盘价跌穿 HVN 区域
+        breached_hvn = None
+        for lo, hi, ratio in hvn_zones:
+            # 前收盘在 HVN 上方或内部，今开盘跌穿 HVN 下沿
+            if prev_close >= lo and today_open < lo:
+                breached_hvn = (lo, hi, ratio)
+                break
+
+        if breached_hvn is None:
+            default_result['gap_size'] = round(gap_size, 2)
+            default_result['gap_atr_ratio'] = round(gap_atr_ratio, 2)
+            default_result['details'] = f'向下跳空 {gap_size:.2f} ({gap_atr_ratio:.1f}x ATR)，但未穿越 HVN'
+            return default_result
+
+        # 两个条件同时满足 → 触发
+        return {
+            'triggered': True,
+            'gap_size': round(gap_size, 2),
+            'gap_atr_ratio': round(gap_atr_ratio, 2),
+            'breached_hvn': breached_hvn,
+            'details': f'跳空毁灭: 向下跳空 {gap_size:.2f} ({gap_atr_ratio:.1f}x ATR)，穿越 HVN ({breached_hvn[0]:.2f}-{breached_hvn[1]:.2f})'
+        }
+
+    except Exception:
+        return default_result
+
+
+def check_circuit_breaker(code: str, df: pd.DataFrame, hvn_zones: list,
+                           demo: bool = False) -> dict:
+    """黑天鹅与熔断检查（最高优先级）
+
+    在所有个股分析之前运行，两层防线：
+    1. 大盘环境阻断：基准指数跌破 MA200 或 VIX 飙升 > 15%
+    2. 个股跳空毁灭：向下跳空穿越 HVN 且幅度 > 1.5x ATR
+
+    Args:
+        code: 股票代码
+        df: OHLCV DataFrame
+        hvn_zones: 高成交量节点
+        demo: 是否为演示模式
+
+    Returns:
+        {
+            'macro_triggered': bool,
+            'gap_triggered': bool,
+            'any_triggered': bool,
+            'macro_data': dict,
+            'gap_data': dict,
+            'override_decision': str | None,
+            'override_text': str,
+            'override_action': str
+        }
+    """
+    result = {
+        'macro_triggered': False,
+        'gap_triggered': False,
+        'any_triggered': False,
+        'macro_data': None,
+        'gap_data': None,
+        'override_decision': None,
+        'override_text': '',
+        'override_action': ''
+    }
+
+    # 1. 大盘环境阻断
+    if demo:
+        result['macro_data'] = {
+            'available': False, 'source': '演示模式已跳过',
+            'benchmark': {'code': '', 'name': '', 'price': None, 'ma200': None, 'below_ma200': False, 'deviation_pct': 0},
+            'vix': {'current': None, 'prev_close': None, 'change_pct': 0, 'spike': False}
+        }
+    else:
+        macro_data = fetch_macro_risk_data(code)
+        result['macro_data'] = macro_data
+
+        if macro_data.get('available'):
+            bm = macro_data['benchmark']
+            vix = macro_data['vix']
+
+            below_ma200 = bm.get('below_ma200', False)
+            vix_spike = vix.get('spike', False)
+
+            if below_ma200 or vix_spike:
+                result['macro_triggered'] = True
+                result['any_triggered'] = True
+                result['override_decision'] = 'CIRCUIT_BREAKER_MACRO'
+                result['override_text'] = '宏观风险熔断，禁止买入'
+                result['override_action'] = '禁止买入'
+
+    # 2. 个股跳空毁灭检测
+    gap_data = check_gap_destruction(df, hvn_zones)
+    result['gap_data'] = gap_data
+
+    if gap_data['triggered']:
+        result['gap_triggered'] = True
+        result['any_triggered'] = True
+        # 跳空毁灭优先级更高（直接影响个股）
+        result['override_decision'] = 'CIRCUIT_BREAKER_GAP'
+        result['override_text'] = '逻辑证伪，切勿接飞刀，观望或止损'
+        result['override_action'] = '观望或止损'
+
+    return result
+
+
+# ============ 仓位管理核心函数 ============
+
+def calc_chandelier_exit(df: pd.DataFrame, atr_multiplier: float = CHANDELIER_ATR_MULTIPLIER,
+                          lookback: int = CHANDELIER_LOOKBACK) -> dict:
+    """
+    计算 Chandelier Exit（吊灯止损）
+
+    做多止损 = 最高价(lookback日) - (atr_multiplier * ATR)
+    做空止损 = 最低价(lookback日) + (atr_multiplier * ATR)
+
+    Args:
+        df: OHLCV DataFrame (必须包含 ATR 列)
+        atr_multiplier: ATR倍数，默认2.5
+        lookback: 回溯天数，默认22日（约一个月）
+
+    Returns:
+        {
+            'long_stop': float,       # 做多止损价
+            'short_stop': float,      # 做空止损价
+            'highest_high': float,    # 区间最高价
+            'lowest_low': float,      # 区间最低价
+            'atr': float,             # 当前ATR值
+            'atr_pct': float,         # ATR占价格百分比
+            'atr_multiplier': float   # 使用的ATR倍数
+        }
+    """
+    default_result = {
+        'long_stop': None,
+        'short_stop': None,
+        'highest_high': None,
+        'lowest_low': None,
+        'atr': None,
+        'atr_pct': None,
+        'atr_multiplier': atr_multiplier
+    }
+
+    if len(df) < lookback:
+        return default_result
+
+    try:
+        last = df.iloc[-1]
+        current_price = last['close']
+
+        # 获取ATR
+        atr = last.get('ATR')
+        if pd.isna(atr):
+            return default_result
+
+        # 计算区间最高价和最低价
+        lookback_df = df.tail(lookback)
+        highest_high = lookback_df['high'].max()
+        lowest_low = lookback_df['low'].min()
+
+        # 计算止损价
+        long_stop = highest_high - (atr_multiplier * atr)
+        short_stop = lowest_low + (atr_multiplier * atr)
+
+        # ATR占价格百分比
+        atr_pct = (atr / current_price) * 100 if current_price > 0 else 0
+
+        return {
+            'long_stop': round(long_stop, 2),
+            'short_stop': round(short_stop, 2),
+            'highest_high': round(highest_high, 2),
+            'lowest_low': round(lowest_low, 2),
+            'atr': round(atr, 2),
+            'atr_pct': round(atr_pct, 2),
+            'atr_multiplier': atr_multiplier
+        }
+
+    except Exception:
+        return default_result
+
+
+def calc_position_sizing(current_price: float, stop_loss: float,
+                          account_size: float = DEFAULT_ACCOUNT_SIZE,
+                          max_risk_pct: float = MAX_RISK_PER_TRADE,
+                          adv: float = None) -> dict:
+    """
+    波动率平价建仓模型
+
+    公式：建议买入股数 = (账户规模 * MAX_RISK_PER_TRADE) / (当前价格 - 止损价)
+    流动性限制：仓位不超过 ADV 的 1%
+
+    Args:
+        current_price: 当前价格
+        stop_loss: 止损价
+        account_size: 账户规模
+        max_risk_pct: 每笔交易最大风险比例
+        adv: 20日平均成交量（股数）
+
+    Returns:
+        {
+            'max_risk_amount': float,     # 本次交易最大承担风险金额
+            'stop_loss': float,           # 止损价
+            'stop_loss_pct': float,       # 止损幅度百分比
+            'suggested_shares': int,      # 建议买入股数（向下取整到100股）
+            'position_value': float,      # 仓位市值
+            'position_pct': float,        # 占账户比例
+            'volatility_warning': str,    # 波动率警告
+            'risk_reward_warning': str,   # 盈亏比警告
+            'liquidity_warning': str,     # 流动性警告
+            'is_valid': bool              # 仓位是否有效
+        }
+    """
+    default_result = {
+        'max_risk_amount': 0,
+        'stop_loss': stop_loss,
+        'stop_loss_pct': 0,
+        'suggested_shares': 0,
+        'position_value': 0,
+        'position_pct': 0,
+        'volatility_warning': '',
+        'risk_reward_warning': '',
+        'liquidity_warning': '',
+        'is_valid': False
+    }
+
+    if current_price is None or stop_loss is None or current_price <= 0:
+        return default_result
+
+    try:
+        # 计算风险金额
+        max_risk_amount = account_size * max_risk_pct
+
+        # 计算止损幅度
+        stop_loss_pct = (current_price - stop_loss) / current_price
+
+        # 每股风险
+        risk_per_share = current_price - stop_loss
+
+        if risk_per_share <= 0:
+            default_result['risk_reward_warning'] = '⚠ 止损价高于当前价，无法计算仓位'
+            return default_result
+
+        # 计算建议买入股数（向下取整到100股）
+        raw_shares = max_risk_amount / risk_per_share
+        suggested_shares = int(raw_shares // 100) * 100  # 向下取整到100股
+
+        # 流动性惩罚：仓位不超过 ADV 的 1%
+        liquidity_warning = ''
+        if adv and adv > 0 and not pd.isna(adv):
+            max_shares_by_adv = int(adv * ADV_POSITION_LIMIT)
+            max_shares_by_adv = (max_shares_by_adv // 100) * 100
+            if max_shares_by_adv > 0 and suggested_shares > max_shares_by_adv:
+                suggested_shares = max_shares_by_adv
+                liquidity_warning = f"⚠ 流动性限制: 仓位上限 {max_shares_by_adv} 股 (ADV {adv:,.0f} 的 1%)"
+
+        # 仓位市值
+        position_value = suggested_shares * current_price
+
+        # 占账户比例
+        position_pct = (position_value / account_size) * 100 if account_size > 0 else 0
+
+        # 波动率警告
+        volatility_warning = ''
+        if stop_loss_pct > 0.05:
+            volatility_warning = f"⚠ 当前波动率过高，止损幅度 {stop_loss_pct*100:.1f}% > 5%，建议谨慎入场或降低仓位"
+
+        # 盈亏比警告
+        risk_reward_warning = ''
+        if suggested_shares < 100:
+            risk_reward_warning = f"⚠ 止损幅度过大({stop_loss_pct*100:.1f}%)，建议买入数量不足100股，盈亏比极差"
+        elif suggested_shares == 0:
+            risk_reward_warning = f"⚠ 止损幅度过大({stop_loss_pct*100:.1f}%)，无法建仓，盈亏比极差"
+
+        return {
+            'max_risk_amount': round(max_risk_amount, 2),
+            'stop_loss': round(stop_loss, 2),
+            'stop_loss_pct': round(stop_loss_pct, 4),
+            'suggested_shares': suggested_shares,
+            'position_value': round(position_value, 2),
+            'position_pct': round(position_pct, 2),
+            'volatility_warning': volatility_warning,
+            'risk_reward_warning': risk_reward_warning,
+            'liquidity_warning': liquidity_warning,
+            'is_valid': suggested_shares >= 100
+        }
+
+    except Exception:
+        return default_result
+
+
 # ============ 精确买卖/止损/目标价 + 检查清单 ============
 
 def calculate_price_targets(df: pd.DataFrame, resonance: dict, consensus: dict,
-                           support: list, resistance: list, contrarian: dict = None) -> dict:
+                           support: list, resistance: list, contrarian: dict = None,
+                           account_size: float = DEFAULT_ACCOUNT_SIZE) -> dict:
     """计算精确的买卖价格和止损价
 
     买入价计算逻辑:
@@ -1032,14 +1673,17 @@ def calculate_price_targets(df: pd.DataFrame, resonance: dict, consensus: dict,
     - 备选: 当前价格 * 0.98
 
     止损价计算逻辑:
-    - 优先: 跌破关键支撑位
-    - 次选: ATR止损 (close - 2*ATR)
-    - 备选: 买入价 * 0.95
+    - 优先: Chandelier Exit（吊灯止损）
+    - 次选: 跌破关键支撑位
+    - 备选: ATR止损 (close - 2*ATR)
 
     目标价计算逻辑:
     - 优先: 目标价来自机构共识
     - 次选: 上涨至前高/压力位
     - 备选: 上涨空间 = 止损幅度的2倍
+
+    仓位计算:
+    - 使用波动率平价模型: 建议买入股数 = MAX_RISK_PER_TRADE / (当前价格 - 止损价)
     """
     last = df.iloc[-1]
     current_price = last['close']
@@ -1049,10 +1693,11 @@ def calculate_price_targets(df: pd.DataFrame, resonance: dict, consensus: dict,
         'stop_loss': None,
         'target_price': None,
         'risk_reward': None,
-        'position_size': None,
+        'position_info': None,
         'buy_reason': '',
         'stop_reason': '',
-        'target_reason': ''
+        'target_reason': '',
+        'chandelier_info': None
     }
 
     try:
@@ -1096,28 +1741,31 @@ def calculate_price_targets(df: pd.DataFrame, resonance: dict, consensus: dict,
             buy_price = current_price * 0.98
             buy_reason = '2%回调'
 
-        # ========== 止损价 ==========
+        # ========== 止损价（优先使用 Chandelier Exit）==========
         stop_loss = None
         stop_reason = ''
 
-        # 方案1: 跌破支撑位下方
-        if support:
+        # 方案1: Chandelier Exit（吊灯止损）
+        chandelier = calc_chandelier_exit(df)
+        chandelier_info = chandelier
+
+        if chandelier['long_stop'] is not None:
+            stop_loss = chandelier['long_stop']
+            stop_reason = f"Chandelier Exit({chandelier['atr_multiplier']}x ATR, 区间最高{chandelier['highest_high']:.2f})"
+
+        # 方案2: 跌破支撑位下方（作为备选）
+        if stop_loss is None and support:
             valid_supports = [s for s in support if s < buy_price]
             if valid_supports:
                 stop_loss = min(valid_supports) * 0.98
                 stop_reason = f'跌破支撑位({min(valid_supports):.2f})'
 
-        # 方案2: ATR止损
+        # 方案3: ATR止损（最后备选）
         if stop_loss is None:
             atr = last.get('ATR')
             if pd.notna(atr):
                 stop_loss = buy_price - 2 * atr
                 stop_reason = f'ATR止损({2*atr:.2f})'
-
-        # 方案3: 5%止损
-        if stop_loss is None:
-            stop_loss = buy_price * 0.95
-            stop_reason = '5%固定止损'
 
         # ========== 目标价 ==========
         target_price = None
@@ -1143,42 +1791,54 @@ def calculate_price_targets(df: pd.DataFrame, resonance: dict, consensus: dict,
                 target_reason = f'60日最高({high_60:.2f})'
 
         # 方案4: 2倍止损空间
-        if target_price is None:
+        if target_price is None and stop_loss:
             risk = buy_price - stop_loss
             target_price = buy_price + risk * 2
             target_reason = '2倍风险报酬'
 
         # ========== 风险报酬比 ==========
-        risk = buy_price - stop_loss
-        reward = target_price - buy_price
+        risk_reward = None
+        if stop_loss and buy_price:
+            risk = buy_price - stop_loss
+            if risk > 0 and target_price:
+                reward = target_price - buy_price
+                risk_reward = round(reward / risk, 1)
 
-        if risk > 0:
-            risk_reward = round(reward / risk, 1)
-        else:
-            risk_reward = None
+        # ========== 滑点复核 ==========
+        risk_reward_after_slippage = None
+        slippage_ev_warning = ''
+        if buy_price and stop_loss and target_price:
+            slippage_buy = buy_price * (1 + SLIPPAGE_PCT)
+            slippage_stop = stop_loss * (1 - SLIPPAGE_PCT)
+            slippage_risk = slippage_buy - slippage_stop
+            slippage_reward = target_price - slippage_buy
 
-        # ========== 建议仓位 ==========
-        if risk_reward:
-            if risk_reward >= 3:
-                position_size = 30
-            elif risk_reward >= 2:
-                position_size = 20
-            elif risk_reward >= 1:
-                position_size = 15
-            else:
-                position_size = 10
-        else:
-            position_size = 10
+            if slippage_risk > 0:
+                risk_reward_after_slippage = round(slippage_reward / slippage_risk, 1)
+
+            if risk_reward_after_slippage is not None and risk_reward_after_slippage < 2.0:
+                slippage_ev_warning = f"⚠ 滑点后盈亏比 {risk_reward_after_slippage:.1f} < 2.0，EV 不足"
+
+        # ========== 仓位计算（波动率平价模型）==========
+        adv = last.get('ADV20')
+        adv_val = adv if pd.notna(adv) else None
+
+        position_info = None
+        if stop_loss:
+            position_info = calc_position_sizing(current_price, stop_loss, account_size, adv=adv_val)
 
         return {
-            'buy_price': round(buy_price, 2),
-            'stop_loss': round(stop_loss, 2),
-            'target_price': round(target_price, 2),
+            'buy_price': round(buy_price, 2) if buy_price else None,
+            'stop_loss': round(stop_loss, 2) if stop_loss else None,
+            'target_price': round(target_price, 2) if target_price else None,
             'risk_reward': risk_reward,
-            'position_size': position_size,
+            'risk_reward_after_slippage': risk_reward_after_slippage,
+            'slippage_ev_warning': slippage_ev_warning,
+            'position_info': position_info,
             'buy_reason': buy_reason,
             'stop_reason': stop_reason,
-            'target_reason': target_reason
+            'target_reason': target_reason,
+            'chandelier_info': chandelier_info
         }
 
     except Exception as e:
@@ -1314,141 +1974,320 @@ def generate_checklist(df: pd.DataFrame, resonance: dict, signals: dict,
     return results
 
 
-# ============ LLM决策仪表盘 ============
+# ============ SMC + EV 严格决策树 ============
 
-def generate_decision_dashboard(resonance: dict, fund_flow: dict,
-                                sentiment: dict, consensus: dict,
-                                win_rate: dict, contrarian: dict = None) -> dict:
-    """生成LLM风格决策仪表盘（零成本实现）
+def generate_smc_decision_tree(df: pd.DataFrame, price_targets: dict,
+                                contrarian: dict, distribution: dict,
+                                chandelier: dict) -> dict:
+    """基于 SMC（聪明钱概念）+ EV（期望值）的严格决策树
 
-    评分权重:
-    - 技术面(30%): strong_buy=90, buy=70, neutral=50, sell=30, strong_sell=10
-    - 资金面(25%): 持续流入=80, 流入=65, 观望=50, 流出=35, 持续流出=20
-    - 舆情(10%): 利好=80, 中性=50, 利空=20
-    - 机构(10%): buy=85, hold=50, sell=15
-    - 左侧信号(25%): 来自contrarian composite_score
+    决策逻辑:
+    1. SELL: 满足任意 1 个卖出条件（优先级最高）
+    2. BUY: 必须同时满足 4 个买入条件
+    3. HOLD: 其他所有情况
+
+    Args:
+        df: OHLCV DataFrame (包含 ChoCh/BoS 列)
+        price_targets: 来自 calculate_price_targets()
+        contrarian: 来自 calc_contrarian_signals()
+        distribution: 来自 calc_distribution_patterns()
+        chandelier: 来自 calc_chandelier_exit()
 
     Returns:
         {
-            'core_conclusion': str,
-            'bullish_score': int,
-            'bearish_score': int,
-            'sideways_score': int,
-            'verdict': str,
-            'action': str,
-            'confidence': str,
-            'factors': dict
+            'decision': 'BUY' | 'SELL' | 'HOLD_WITH_POSITION' | 'HOLD_EMPTY',
+            'decision_text': str,
+            'confidence': 'HIGH' | 'MEDIUM' | 'LOW',
+            'buy_conditions': dict,
+            'sell_conditions': dict,
+            'buy_details': dict,
+            'sell_details': dict,
+            'reasoning': list,
+            'warnings': list
         }
     """
-    # 技术面评分 (40%)
-    tech_score = {
-        'strong_buy': 90,
-        'buy': 70,
-        'neutral': 50,
-        'sell': 30,
-        'strong_sell': 10
-    }.get(resonance.get('resonance', 'neutral'), 50)
+    last = df.iloc[-1]
+    current_price = last['close']
+    reasoning = []
+    warnings = []
 
-    # 资金面评分 (30%)
-    fund_signal = fund_flow.get('signal', '未知')
-    fund_trend = fund_flow.get('trend', '观望')
+    # ========== 买入条件检查 ==========
 
-    if fund_trend == '持续流入':
-        fund_score = 80
-    elif fund_signal == '净流入':
-        fund_score = 65
-    elif fund_trend == '反弹':
-        fund_score = 60
-    elif fund_signal == '净流出':
-        fund_score = 35
-    elif fund_trend == '持续流出':
-        fund_score = 20
+    # 条件 1: ChoCh 确认（下降趋势中出现 Higher High）
+    choch_signal = last.get('choch_signal', 0)
+    choch_strength = last.get('choch_strength', 0)
+    choch_confirmed = (choch_signal == 1 and choch_strength > 50)
+
+    choch_detail = ''
+    if choch_confirmed:
+        choch_detail = f"看多 ChoCh 确认 (强度: {choch_strength:.1f})"
+    elif choch_signal == 1:
+        choch_detail = f"ChoCh 信号弱 (强度: {choch_strength:.1f} < 50)"
+    elif choch_signal == -1:
+        choch_detail = f"看空 ChoCh (强度: {choch_strength:.1f})"
     else:
-        fund_score = 50
+        choch_detail = "无明确趋势特性改变"
 
-    # 舆情评分 (15%)
-    sent_score = {
-        '利好': 80,
-        '中性': 50,
-        '利空': 20
-    }.get(sentiment.get('sentiment', '中性'), 50)
+    # 条件 2: 回踩确认（价格测试 HVN 或 FVG）
+    hvn_zones = []
+    if contrarian:
+        hvn_zones = contrarian.get('volume_exhaustion', {}).get('hvn_zones', [])
 
-    # 机构评分 (15%)
-    consensus_rating = consensus.get('rating', 'hold') if consensus else 'hold'
-    institution_score = {
-        'buy': 85,
-        'hold': 50,
-        'sell': 15
-    }.get(consensus_rating, 50)
+    fvg_zones = []
+    if contrarian:
+        sr_inst = contrarian.get('sr_institutional', {})
+        fvg_zones = sr_inst.get('fvg_zones', [])
 
-    # 左侧信号评分 (25%)
-    contrarian_score = 50
-    if contrarian and contrarian.get('composite_score') is not None:
-        contrarian_score = contrarian['composite_score']
+    bullish_fvgs = [f for f in fvg_zones if f['type'] == 'bullish' and not f.get('filled', True)]
 
-    # 计算综合评分
-    bullish_score = int(tech_score * 0.30 + fund_score * 0.25 + sent_score * 0.10 +
-                        institution_score * 0.10 + contrarian_score * 0.25)
-    bearish_score = 100 - bullish_score
+    price_in_hvn = any(lo <= current_price <= hi for lo, hi, _ in hvn_zones)
+    price_in_fvg = any(f['bottom'] <= current_price <= f['top'] for f in bullish_fvgs)
+    price_testing_zone = price_in_hvn or price_in_fvg
 
-    # 震荡评分（基于ADX或市场状态）
-    sideways_score = min(bullish_score, bearish_score) * 0.5
-
-    # 判断多空
-    if bullish_score >= 70:
-        verdict = '看多'
-    elif bearish_score >= 70:
-        verdict = '看空'
+    zone_detail = ''
+    if price_in_hvn:
+        matched = [(lo, hi) for lo, hi, _ in hvn_zones if lo <= current_price <= hi]
+        if matched:
+            zone_detail = f"价格在 HVN 区域 ({matched[0][0]:.2f}-{matched[0][1]:.2f})"
+    elif price_in_fvg:
+        matched = [f for f in bullish_fvgs if f['bottom'] <= current_price <= f['top']]
+        if matched:
+            zone_detail = f"价格在看多 FVG ({matched[0]['bottom']:.2f}-{matched[0]['top']:.2f})"
     else:
-        verdict = '震荡'
+        zone_detail = "价格未在 HVN 或 FVG 区域内"
 
-    # 行动建议
-    if verdict == '看多':
-        if bullish_score >= 85:
-            action = '加仓'
+    # 条件 3: R-Multiple > 2.0
+    risk_reward = price_targets.get('risk_reward') if price_targets else None
+    risk_reward_valid = (risk_reward is not None and risk_reward >= 2.0)
+
+    rr_detail = ''
+    if risk_reward is not None:
+        rr_detail = f"R-Multiple = {risk_reward:.1f}"
+        if not risk_reward_valid:
+            rr_detail += " (< 2.0，强制观望)"
+    else:
+        rr_detail = "无法计算盈亏比"
+
+    # 条件 4: Z-Score 验证
+    zscore_data = contrarian.get('zscore', {}) if contrarian else {}
+    zscore = zscore_data.get('zscore', 0)
+    sufficient_data = zscore_data.get('sufficient_data', False)
+    zscore_valid = (not sufficient_data) or (-2 <= zscore <= 2)
+
+    zscore_detail = ''
+    if not sufficient_data:
+        zscore_detail = "数据不足，跳过验证"
+    elif zscore_valid:
+        zscore_detail = f"Z = {zscore:.2f} (正常区间)"
+    else:
+        zscore_detail = f"Z = {zscore:.2f} (极端区域，不宜操作)"
+
+    buy_conditions = {
+        'choch_confirmed': choch_confirmed,
+        'price_testing_zone': price_testing_zone,
+        'risk_reward_valid': risk_reward_valid,
+        'zscore_valid': zscore_valid
+    }
+
+    buy_details = {
+        'choch': choch_detail,
+        'zone': zone_detail,
+        'risk_reward': rr_detail,
+        'zscore': zscore_detail
+    }
+
+    # ========== 卖出条件检查 ==========
+
+    # 条件 1: 跌破 Chandelier Exit 止损
+    long_stop = chandelier.get('long_stop') if chandelier else None
+    stop_loss_triggered = (long_stop is not None and current_price < long_stop)
+
+    stop_detail = ''
+    if long_stop is not None:
+        if stop_loss_triggered:
+            stop_detail = f"当前价 {current_price:.2f} < 止损价 {long_stop:.2f}"
         else:
-            action = '买入'
-    elif verdict == '看空':
-        if bearish_score >= 85:
-            action = '清仓'
+            stop_detail = f"当前价 {current_price:.2f} > 止损价 {long_stop:.2f}"
+    else:
+        stop_detail = "止损价未计算"
+
+    # 条件 2: 派发模式（放量滞涨）
+    dist_score = distribution.get('distribution_score', 0) if distribution else 0
+    dist_patterns = distribution.get('patterns', []) if distribution else []
+    distribution_detected = (dist_score >= 70 or 'volume_climax' in dist_patterns)
+
+    dist_detail = ''
+    if distribution_detected:
+        triggered = []
+        if 'volume_climax' in dist_patterns:
+            triggered.append('放量滞涨')
+        if dist_score >= 70:
+            triggered.append(f'派发评分 {dist_score}')
+        dist_detail = f"派发信号: {', '.join(triggered)}"
+    else:
+        dist_detail = f"派发评分 {dist_score} 分"
+
+    sell_conditions = {
+        'stop_loss_triggered': stop_loss_triggered,
+        'distribution_detected': distribution_detected
+    }
+
+    sell_details = {
+        'stop_loss': stop_detail,
+        'distribution': dist_detail
+    }
+
+    # ========== 决策逻辑 ==========
+    # SELL 优先于 BUY（止损无条件执行）
+    if any(sell_conditions.values()):
+        decision = 'SELL'
+        decision_text = '清仓卖出'
+        confidence = 'HIGH'
+
+        if stop_loss_triggered:
+            reasoning.append('价格跌破 Chandelier Exit 止损线，趋势破坏')
+            warnings.append('止损已触发，必须立即离场')
+        if distribution_detected:
+            reasoning.append('检测到高位派发模式，机构正在退出')
+            if 'volume_climax' in dist_patterns:
+                warnings.append('放量滞涨: 成交量放大但价格不涨，典型派发特征')
+
+    elif all(buy_conditions.values()):
+        decision = 'BUY'
+        decision_text = '买入'
+        confidence = 'HIGH'
+
+        reasoning.append(f'结构确认: {choch_detail}')
+        reasoning.append(f'回踩确认: {zone_detail}')
+        reasoning.append(f'盈亏比优秀: {rr_detail}')
+
+        # 附加风险提示
+        if price_targets and price_targets.get('position_info', {}).get('volatility_warning'):
+            warnings.append(price_targets['position_info']['volatility_warning'])
+
+    else:
+        # HOLD — 区分持仓观望和空仓观望
+        if long_stop and current_price > long_stop:
+            decision = 'HOLD_WITH_POSITION'
+            decision_text = '持仓观望'
         else:
-            action = '减仓'
-    else:
-        action = '持仓观望'
+            decision = 'HOLD_EMPTY'
+            decision_text = '空仓观望'
 
-    # 置信度
-    diff = abs(bullish_score - bearish_score)
-    if diff >= 40:
-        confidence = '高'
-    elif diff >= 20:
-        confidence = '中'
-    else:
-        confidence = '低'
+        # 置信度取决于缺失条件数量
+        missing = sum(1 for v in buy_conditions.values() if not v)
+        confidence = 'LOW' if missing >= 3 else 'MEDIUM'
 
-    # 核心结论
-    tech_dir = '偏多' if tech_score >= 60 else ('偏空' if tech_score <= 40 else '中性')
-    fund_dir = '流入' if fund_score >= 60 else ('流出' if fund_score <= 40 else '观望')
-    sent_dir = sentiment.get('sentiment', '中性')
-    consensus_dir = {'buy': '看涨', 'hold': '观望', 'sell': '看跌'}.get(consensus_rating, '观望')
-    contrarian_dir = '左侧看多' if contrarian_score >= 65 else ('左侧看空' if contrarian_score <= 35 else '左侧中性')
-
-    core_conclusion = f"技术面{tech_dir}+资金{fund_dir}+舆情{sent_dir}+机构{consensus_dir}+{contrarian_dir}，综合评分{bullish_score}分"
+        # 说明缺失的条件
+        if not choch_confirmed:
+            reasoning.append('缺少结构确认: ChoCh 信号未触发')
+        if not price_testing_zone:
+            reasoning.append('缺少回踩确认: 价格未在 HVN/FVG 区域')
+        if not risk_reward_valid:
+            reasoning.append(f'盈亏比不足: {rr_detail}')
+        if not zscore_valid:
+            reasoning.append(f'Z-Score 极端: {zscore_detail}')
 
     return {
-        'core_conclusion': core_conclusion,
-        'bullish_score': bullish_score,
-        'bearish_score': bearish_score,
-        'sideways_score': int(sideways_score),
-        'verdict': verdict,
-        'action': action,
+        'decision': decision,
+        'decision_text': decision_text,
         'confidence': confidence,
-        'factors': {
-            '技术面': tech_dir,
-            '资金面': fund_dir,
-            '舆情': sent_dir,
-            '机构': consensus_dir,
-            '左侧信号': contrarian_dir
+        'buy_conditions': buy_conditions,
+        'sell_conditions': sell_conditions,
+        'buy_details': buy_details,
+        'sell_details': sell_details,
+        'reasoning': reasoning,
+        'warnings': warnings
+    }
+
+
+def generate_decision_dashboard(df: pd.DataFrame, price_targets: dict,
+                                contrarian: dict, distribution: dict,
+                                chandelier: dict, circuit_breaker: dict = None) -> dict:
+    """决策仪表盘 (基于 SMC + EV 严格决策树)
+
+    如果 circuit_breaker 触发，强制覆写一切买入信号。
+
+    Returns:
+        {
+            'decision': str,
+            'decision_text': str,
+            'confidence': str,
+            'buy_conditions': dict,
+            'sell_conditions': dict,
+            'buy_details': dict,
+            'sell_details': dict,
+            'reasoning': list,
+            'warnings': list,
+            'action': str,
+            'verdict': str,
+            'core_conclusion': str,
+            'circuit_breaker': dict
         }
+    """
+    # 熔断检查（最高优先级，覆写一切）
+    if circuit_breaker and circuit_breaker.get('any_triggered'):
+        override = circuit_breaker['override_decision']
+        override_text = circuit_breaker['override_text']
+        override_action = circuit_breaker['override_action']
+
+        reasoning = []
+        warnings = []
+
+        if circuit_breaker.get('macro_triggered'):
+            macro = circuit_breaker.get('macro_data', {})
+            bm = macro.get('benchmark', {})
+            vix = macro.get('vix', {})
+            if bm.get('below_ma200'):
+                reasoning.append(f"基准指数 {bm.get('name', '')} 跌破 MA200 ({bm.get('price', 0):.2f} < {bm.get('ma200', 0):.2f})")
+            if vix.get('spike'):
+                reasoning.append(f"VIX 日内飙升 {vix.get('change_pct', 0):.1f}% (> 15%)")
+            warnings.append('宏观风险极高，全局禁止任何买入操作')
+
+        if circuit_breaker.get('gap_triggered'):
+            gap = circuit_breaker.get('gap_data', {})
+            reasoning.append(f"向下跳空 {gap.get('gap_size', 0):.2f} ({gap.get('gap_atr_ratio', 0):.1f}x ATR) 穿越 HVN")
+            warnings.append('逻辑证伪，切勿接飞刀，无视任何超卖反弹指标')
+
+        return {
+            'decision': override,
+            'decision_text': override_text,
+            'confidence': 'HIGH',
+            'buy_conditions': {},
+            'sell_conditions': {},
+            'buy_details': {},
+            'sell_details': {},
+            'reasoning': reasoning,
+            'warnings': warnings,
+            'action': override_action,
+            'verdict': override_text,
+            'core_conclusion': f"⚠ 熔断: {override_text}",
+            'circuit_breaker': circuit_breaker
+        }
+
+    smc = generate_smc_decision_tree(df, price_targets, contrarian, distribution, chandelier)
+
+    # 映射到兼容接口
+    decision_map = {
+        'BUY': {'action': '买入', 'verdict': '买入'},
+        'SELL': {'action': '清仓', 'verdict': '清仓'},
+        'HOLD_WITH_POSITION': {'action': '持仓观望', 'verdict': '观望'},
+        'HOLD_EMPTY': {'action': '空仓观望', 'verdict': '观望'}
+    }
+    mapped = decision_map.get(smc['decision'], {'action': '观望', 'verdict': '观望'})
+
+    # 生成一句话结论
+    buy_ok = sum(1 for v in smc['buy_conditions'].values() if v)
+    buy_total = len(smc['buy_conditions'])
+    core_conclusion = f"SMC决策: {smc['decision_text']} (买入条件 {buy_ok}/{buy_total})"
+    if smc['reasoning']:
+        core_conclusion += f" — {smc['reasoning'][0]}"
+
+    return {
+        **smc,
+        'action': mapped['action'],
+        'verdict': mapped['verdict'],
+        'core_conclusion': core_conclusion
     }
 
 
@@ -1618,6 +2457,12 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     except Exception:
         df['MA200'] = np.nan
         df['MA200_std'] = np.nan
+
+    # ADV (20日平均成交量)
+    try:
+        df['ADV20'] = df['volume'].rolling(20).mean()
+    except Exception:
+        df['ADV20'] = np.nan
 
     # ========== 新增右侧确认指标 ==========
 
@@ -2288,6 +3133,287 @@ def calc_volume_exhaustion(df: pd.DataFrame, lookback: int = 20) -> dict:
     return result
 
 
+def find_anchor_point(df: pd.DataFrame) -> dict:
+    """自动识别 Volume Profile 的锚定点
+
+    优先级（从高到低）：
+    1. 最近一次 BoS（结构突破）点
+    2. 近期最大放量日（成交量 > 3倍MA20）
+    3. 财报跳空日（Gap > 3%）
+    4. Fallback: 60天前
+
+    Returns:
+        {
+            'anchor_type': 'bos' | 'volume_climax' | 'earnings_gap' | 'fallback',
+            'anchor_index': int,           # 锚定点在 df 中的索引
+            'anchor_date': str,            # 锚定日期
+            'anchor_price': float,         # 锚定点价格
+            'anchor_details': str,         # 锚定点说明
+            'days_since_anchor': int       # 距今天数
+        }
+    """
+    default_result = {
+        'anchor_type': 'fallback',
+        'anchor_index': max(0, len(df) - 60),
+        'anchor_date': str(df.iloc[max(0, len(df) - 60)]['date']) if len(df) > 0 else '',
+        'anchor_price': df.iloc[max(0, len(df) - 60)]['close'] if len(df) > 0 else 0,
+        'anchor_details': '默认锚定点（60天前）',
+        'days_since_anchor': min(60, len(df))
+    }
+
+    if len(df) < 30:
+        return default_result
+
+    try:
+        # 计算 BoS（复用已有函数的逻辑）
+        vol_ma20 = df['volume'].rolling(20).mean()
+
+        # 1. 查找最近一次 BoS 点
+        # BoS 定义：突破前一个波段高点/低点，且成交量放大
+        lookback = min(60, len(df) - 10)
+        for i in range(len(df) - 1, max(lookback, 10), -1):
+            window = df.iloc[max(0, i-20):i+1]
+            if len(window) < 10:
+                continue
+
+            # 简化的 BoS 检测：收盘价创 window新高或新低，且成交量放大
+            current_close = df.iloc[i]['close']
+            current_vol = df.iloc[i]['volume']
+            vol_ma = vol_ma20.iloc[i] if i < len(vol_ma20) else None
+
+            window_high = window['high'].max()
+            window_low = window['low'].min()
+
+            is_breakout_up = current_close >= window_high * 0.995 and current_vol and vol_ma and current_vol > vol_ma * 1.3
+            is_breakout_down = current_close <= window_low * 1.005 and current_vol and vol_ma and current_vol > vol_ma * 1.3
+
+            if is_breakout_up or is_breakout_down:
+                return {
+                    'anchor_type': 'bos',
+                    'anchor_index': i,
+                    'anchor_date': str(df.iloc[i]['date']),
+                    'anchor_price': df.iloc[i]['close'],
+                    'anchor_details': f"结构突破点({'向上' if is_breakout_up else '向下'})",
+                    'days_since_anchor': len(df) - 1 - i
+                }
+
+        # 2. 查找近期最大放量日
+        vol_ratio = df['volume'] / vol_ma20
+        vol_ratio = vol_ratio.fillna(0)
+
+        # 找成交量比值最大的那一天（排除最近5天，避免噪音）
+        for i in range(len(df) - 6, max(lookback, 10), -1):
+            if vol_ratio.iloc[i] > 3.0:
+                return {
+                    'anchor_type': 'volume_climax',
+                    'anchor_index': i,
+                    'anchor_date': str(df.iloc[i]['date']),
+                    'anchor_price': df.iloc[i]['close'],
+                    'anchor_details': f"放量日(量比={vol_ratio.iloc[i]:.1f}x)",
+                    'days_since_anchor': len(df) - 1 - i
+                }
+
+        # 如果没有 >3x 的，找最大的
+        max_vol_idx = vol_ratio.iloc[max(lookback, 10):len(df)-5].idxmax()
+        if max_vol_idx is not None and vol_ratio.iloc[max_vol_idx] > 2.0:
+            return {
+                'anchor_type': 'volume_climax',
+                'anchor_index': max_vol_idx,
+                'anchor_date': str(df.iloc[max_vol_idx]['date']),
+                'anchor_price': df.iloc[max_vol_idx]['close'],
+                'anchor_details': f"最大放量日(量比={vol_ratio.iloc[max_vol_idx]:.1f}x)",
+                'days_since_anchor': len(df) - 1 - max_vol_idx
+            }
+
+        # 3. 查找财报跳空日
+        df['gap'] = abs(df['open'] - df['close'].shift(1)) / df['close'].shift(1) * 100
+        for i in range(len(df) - 1, max(lookback, 10), -1):
+            gap = df.iloc[i]['gap']
+            vol = df.iloc[i]['volume']
+            vol_ma = vol_ma20.iloc[i] if i < len(vol_ma20) else None
+            if gap > 3.0 and vol and vol_ma and vol > vol_ma * 1.2:
+                gap_dir = '向上' if df.iloc[i]['open'] > df.iloc[i-1]['close'] else '向下'
+                return {
+                    'anchor_type': 'earnings_gap',
+                    'anchor_index': i,
+                    'anchor_date': str(df.iloc[i]['date']),
+                    'anchor_price': df.iloc[i]['close'],
+                    'anchor_details': f"跳空日({gap_dir}跳空{gap:.1f}%)",
+                    'days_since_anchor': len(df) - 1 - i
+                }
+
+        # 4. Fallback
+        fallback_idx = max(0, len(df) - 60)
+        return {
+            'anchor_type': 'fallback',
+            'anchor_index': fallback_idx,
+            'anchor_date': str(df.iloc[fallback_idx]['date']),
+            'anchor_price': df.iloc[fallback_idx]['close'],
+            'anchor_details': '默认锚定点（60天前）',
+            'days_since_anchor': len(df) - 1 - fallback_idx
+        }
+
+    except Exception:
+        return default_result
+
+
+def calc_anchored_volume_profile(df: pd.DataFrame, value_area_pct: float = 0.7) -> dict:
+    """计算锚定筹码分布 (Anchored Volume Profile)
+
+    从自动识别的锚定点开始，计算至今的筹码分布
+
+    Args:
+        df: OHLCV DataFrame
+        value_area_pct: Value Area 包含的成交量比例，默认70%
+
+    Returns:
+        {
+            'anchor_info': dict,           # 来自 find_anchor_point()
+            'poc': float,                  # Point of Control - 最大成交量价位
+            'vah': float,                  # Value Area High
+            'val': float,                  # Value Area Low
+            'total_volume': float,         # 总成交量
+            'price_range': (low, high),    # 价格区间
+            'hvn_zones': [(low, high, vol_ratio), ...],  # 高成交量节点
+            'lnv_zones': [(low, high, vol_ratio), ...],  # 低成交量节点
+            'support_levels': [float, ...], # 基于VP的支撑位
+            'resistance_levels': [float, ...], # 基于VP的压力位
+            'interpretation': str           # 筹码分布解读
+        }
+    """
+    default_result = {
+        'anchor_info': None,
+        'poc': None,
+        'vah': None,
+        'val': None,
+        'total_volume': 0,
+        'price_range': (None, None),
+        'hvn_zones': [],
+        'lnv_zones': [],
+        'support_levels': [],
+        'resistance_levels': [],
+        'interpretation': '数据不足，无法计算筹码分布'
+    }
+
+    if len(df) < 30:
+        return default_result
+
+    try:
+        # 1. 找锚定点
+        anchor_info = find_anchor_point(df)
+        anchor_idx = anchor_info['anchor_index']
+
+        # 2. 从锚定点到现在的数据
+        vp_df = df.iloc[anchor_idx:].copy()
+
+        if len(vp_df) < 10:
+            return default_result
+
+        # 3. 价格分箱 - 使用 (high + low) / 2 作为代表价格
+        vp_df['typical_price'] = (vp_df['high'] + vp_df['low']) / 2
+
+        price_min = vp_df['low'].min()
+        price_max = vp_df['high'].max()
+
+        if price_max <= price_min:
+            return default_result
+
+        # 自适应分箱数量（约100个bins，但根据数据量调整）
+        n_bins = min(100, max(20, len(vp_df) // 2))
+        bin_size = (price_max - price_min) / n_bins
+
+        # 4. 计算每个价格区间的成交量
+        bins_volume = []
+        for b in range(n_bins):
+            bin_low = price_min + b * bin_size
+            bin_high = bin_low + bin_size
+            bin_mid = (bin_low + bin_high) / 2
+
+            # 统计落在该区间的K线成交量
+            # 使用 typical_price 判断
+            mask = (vp_df['typical_price'] >= bin_low) & (vp_df['typical_price'] < bin_high)
+            vol = vp_df.loc[mask, 'volume'].sum()
+
+            bins_volume.append({
+                'low': bin_low,
+                'high': bin_high,
+                'mid': bin_mid,
+                'volume': vol
+            })
+
+        total_volume = sum(b['volume'] for b in bins_volume)
+        if total_volume == 0:
+            return default_result
+
+        # 5. 计算 POC (Point of Control) - 成交量最大的区间
+        poc_bin = max(bins_volume, key=lambda x: x['volume'])
+        poc = poc_bin['mid']
+
+        # 6. 计算 Value Area (VAH/VAL) - 包含70%成交量的区间
+        sorted_bins = sorted(bins_volume, key=lambda x: x['volume'], reverse=True)
+        va_volume = 0
+        va_bins = []
+        target_va_volume = total_volume * value_area_pct
+
+        for b in sorted_bins:
+            va_bins.append(b)
+            va_volume += b['volume']
+            if va_volume >= target_va_volume:
+                break
+
+        vah = max(b['high'] for b in va_bins)
+        val = min(b['low'] for b in va_bins)
+
+        # 7. 识别 HVN (High Volume Nodes) 和 LNV (Low Volume Nodes)
+        avg_volume = total_volume / n_bins
+        hvn_zones = []
+        lnv_zones = []
+
+        for b in bins_volume:
+            vol_ratio = b['volume'] / avg_volume if avg_volume > 0 else 0
+            if vol_ratio > 1.5:
+                hvn_zones.append((round(b['low'], 2), round(b['high'], 2), round(vol_ratio, 2)))
+            elif vol_ratio < 0.5:
+                lnv_zones.append((round(b['low'], 2), round(b['high'], 2), round(vol_ratio, 2)))
+
+        # 8. 基于VP的支撑压力位
+        current_price = df.iloc[-1]['close']
+
+        # 支撑位：当前价下方的HVN
+        support_levels = sorted([b[0] for b in hvn_zones if b[0] < current_price], reverse=True)[:3]
+
+        # 压力位：当前价上方的HVN
+        resistance_levels = sorted([b[1] for b in hvn_zones if b[1] > current_price])[:3]
+
+        # 9. 筹码分布解读
+        interpretation = ''
+        if current_price > vah:
+            interpretation = f'当前价({current_price:.2f})在VA上方，高位筹码集中，注意派发风险'
+        elif current_price < val:
+            interpretation = f'当前价({current_price:.2f})在VA下方，低位筹码集中，关注反弹机会'
+        elif abs(current_price - poc) / poc < 0.02:
+            interpretation = f'当前价({current_price:.2f})接近POC({poc:.2f})，筹码集中，即将方向选择'
+        else:
+            interpretation = f'当前价在VA内，POC={poc:.2f}'
+
+        return {
+            'anchor_info': anchor_info,
+            'poc': round(poc, 2),
+            'vah': round(vah, 2),
+            'val': round(val, 2),
+            'total_volume': total_volume,
+            'price_range': (round(price_min, 2), round(price_max, 2)),
+            'hvn_zones': hvn_zones,
+            'lnv_zones': lnv_zones,
+            'support_levels': support_levels,
+            'resistance_levels': resistance_levels,
+            'interpretation': interpretation
+        }
+
+    except Exception:
+        return default_result
+
+
 def calc_volatility_regime(df: pd.DataFrame) -> dict:
     """波动率收缩/扩张分析 — ATR百分位、布林带挤压、脉冲信号检测。"""
     result = {
@@ -2787,8 +3913,11 @@ def generate_contrarian_caveats(contrarian: dict, df: pd.DataFrame) -> list:
     return caveats
 
 
-def calc_contrarian_signals(df: pd.DataFrame) -> dict:
-    """左侧交易信号综合分析 — 聚合5个模块，生成综合评分和仓位建议。"""
+def calc_contrarian_signals(df: pd.DataFrame, account_size: float = DEFAULT_ACCOUNT_SIZE) -> dict:
+    """左侧交易信号综合分析 — 聚合5个模块，生成综合评分和仓位建议。
+
+    仓位计算使用波动率平价模型，不再使用固定百分比。
+    """
     zscore = calc_mean_reversion_zscore(df)
     vol_exhaust = calc_volume_exhaustion(df)
     vol_regime = calc_volatility_regime(df)
@@ -2822,30 +3951,34 @@ def calc_contrarian_signals(df: pd.DataFrame) -> dict:
         signal = 'neutral'
         signal_text = '左侧信号中性，暂无明确机会'
 
-    # 仓位建议 (左侧入场、右侧确认)
+    # 仓位建议（使用波动率平价模型）
     position_advice = {
-        'initial_position': 0, 'confirm_position': 0,
-        'confirm_conditions': [], 'stop_loss': None
+        'position_info': None,          # 波动率平价仓位信息
+        'chandelier_info': None,        # Chandelier Exit 信息
+        'confirm_conditions': [],       # 右侧确认条件
+        'action': 'hold'                # 建议操作
     }
-    if signal == 'strong_contrarian_buy':
-        position_advice.update(
-            initial_position=10, confirm_position=20,
-            confirm_conditions=['MACD金叉', '站上5日线', '放量突破']
-        )
-    elif signal == 'contrarian_buy':
-        position_advice.update(
-            initial_position=5, confirm_position=15,
-            confirm_conditions=['KDJ金叉', '站上10日线']
-        )
 
-    # 止损: 最近支撑位下方 1*ATR
-    try:
-        atr = df['ATR'].iloc[-1]
-        supports = sr_inst.get('support', [])
-        if supports and not pd.isna(atr):
-            position_advice['stop_loss'] = round(min(supports) - atr, 2)
-    except Exception:
-        pass
+    # 计算止损价（使用 Chandelier Exit）
+    current_price = df['close'].iloc[-1]
+    chandelier = calc_chandelier_exit(df)
+    stop_loss = chandelier.get('long_stop')
+
+    if signal in ['strong_contrarian_buy', 'contrarian_buy'] and stop_loss:
+        # 计算仓位
+        position_info = calc_position_sizing(current_price, stop_loss, account_size)
+        position_advice['position_info'] = position_info
+        position_advice['chandelier_info'] = chandelier
+
+        if signal == 'strong_contrarian_buy':
+            position_advice['confirm_conditions'] = ['MACD金叉', '站上5日线', '放量突破']
+            position_advice['action'] = 'buy'
+        else:
+            position_advice['confirm_conditions'] = ['KDJ金叉', '站上10日线']
+            position_advice['action'] = 'buy_cautious'
+    else:
+        position_advice['action'] = 'hold'
+        position_advice['position_info'] = None
 
     # 风险警告
     result = {
@@ -3044,37 +4177,35 @@ def analyze_indicator_signals(df: pd.DataFrame) -> Dict[str, dict]:
             rsi_status = f'中性区({last["RSI"]:.1f})'
         indicators['RSI'] = {'signal': rsi_signal, 'status': rsi_status, 'weight': 1}
 
-    # MACD
+    # MACD (辅助指标，仅用于背离检测，决策权重降低)
     if pd.notna(last['MACD']) and pd.notna(last['MACD_signal']):
-        if last['MACD'] > last['MACD_signal'] and last['MACD_hist'] > 0:
+        # 仅在极端值时输出信号，平时保持中性
+        macd_hist = last['MACD_hist']
+        if macd_hist > 0 and abs(macd_hist) > abs(df['MACD_hist'].tail(20).mean()) * 2:
             macd_signal = 'buy'
-            macd_status = '多头运行'
-        elif last['MACD'] < last['MACD_signal'] and last['MACD_hist'] < 0:
+            macd_status = f'强势多头(hist={macd_hist:.2f})'
+        elif macd_hist < 0 and abs(macd_hist) > abs(df['MACD_hist'].tail(20).mean()) * 2:
             macd_signal = 'sell'
-            macd_status = '空头运行'
+            macd_status = f'强势空头(hist={macd_hist:.2f})'
         else:
             macd_signal = 'neutral'
-            macd_status = '震荡'
-        indicators['MACD'] = {'signal': macd_signal, 'status': macd_status, 'weight': 2}
+            macd_status = f'震荡运行(hist={macd_hist:.2f})'
+        indicators['MACD'] = {'signal': macd_signal, 'status': macd_status, 'weight': 1, 'is_auxiliary': True}
 
-    # KDJ
+    # KDJ (辅助指标，仅用于背离检测，决策权重降低)
     if pd.notna(last['KDJ_K']) and pd.notna(last['KDJ_D']):
-        if last['KDJ_K'] > last['KDJ_D'] and last['KDJ_J'] < 80:
+        # 仅在极端超买超卖时输出信号
+        kdj_j = last['KDJ_J']
+        if kdj_j < 10:  # 极端超卖
             kdj_signal = 'buy'
-            kdj_status = f'K>D,J={last["KDJ_J"]:.1f}'
-        elif last['KDJ_K'] < last['KDJ_D'] and last['KDJ_J'] > 20:
+            kdj_status = f'极端超卖(J={kdj_j:.1f})'
+        elif kdj_j > 90:  # 极端超买
             kdj_signal = 'sell'
-            kdj_status = f'K<D,J={last["KDJ_J"]:.1f}'
-        elif last['KDJ_J'] < 20:
-            kdj_signal = 'buy'
-            kdj_status = f'超卖,J={last["KDJ_J"]:.1f}'
-        elif last['KDJ_J'] > 80:
-            kdj_signal = 'sell'
-            kdj_status = f'超买,J={last["KDJ_J"]:.1f}'
+            kdj_status = f'极端超买(J={kdj_j:.1f})'
         else:
             kdj_signal = 'neutral'
-            kdj_status = f'中性,J={last["KDJ_J"]:.1f}'
-        indicators['KDJ'] = {'signal': kdj_signal, 'status': kdj_status, 'weight': 1}
+            kdj_status = f'中性(J={kdj_j:.1f})'
+        indicators['KDJ'] = {'signal': kdj_signal, 'status': kdj_status, 'weight': 0.5, 'is_auxiliary': True}
 
     # ADX
     if pd.notna(last['ADX']) and pd.notna(last['ADX_PDI']) and pd.notna(last['ADX_NDI']):
@@ -3175,16 +4306,31 @@ def analyze_indicator_signals(df: pd.DataFrame) -> Dict[str, dict]:
 
 
 def calculate_resonance(indicators: Dict[str, dict]) -> dict:
-    """计算多指标共振信号"""
+    """计算多指标共振信号
+
+    辅助指标 (is_auxiliary=True) 不计入主共振计算，仅作为辅助信息记录
+    """
     buy_score = 0
     sell_score = 0
     total_weight = 0
     buy_indicators = []
     sell_indicators = []
     neutral_indicators = []
+    auxiliary_buy = []
+    auxiliary_sell = []
 
     for name, info in indicators.items():
         weight = info.get('weight', 1)
+        is_auxiliary = info.get('is_auxiliary', False)
+
+        if is_auxiliary:
+            # 辅助指标不计入主共振，仅记录
+            if info['signal'] == 'buy':
+                auxiliary_buy.append(name)
+            elif info['signal'] == 'sell':
+                auxiliary_sell.append(name)
+            continue
+
         total_weight += weight
         if info['signal'] == 'buy':
             buy_score += weight
@@ -3226,7 +4372,9 @@ def calculate_resonance(indicators: Dict[str, dict]) -> dict:
         'neutral_indicators': neutral_indicators,
         'buy_score': buy_score,
         'sell_score': sell_score,
-        'total_weight': total_weight
+        'total_weight': total_weight,
+        'auxiliary_buy': auxiliary_buy,  # 辅助指标买入信号
+        'auxiliary_sell': auxiliary_sell  # 辅助指标卖出信号
     }
 
 
@@ -3458,6 +4606,8 @@ def build_optional_context(code: str, df: pd.DataFrame, demo: bool = False) -> d
         'fund_flow': fetch_fund_flow(code, df),
         'news_sentiment': {'news': [], 'sentiment': '中性', 'sentiment_score': 0, 'summary': '暂无新闻数据', 'source': '为保障流程稳定已跳过'},
         'consensus': {'rating': 'hold', 'rating_text': '暂无评级数据', 'target_price': None, 'analyst_count': 0, 'source': '为保障流程稳定已跳过'},
+        'options_data': {'available': False, 'source': '已跳过'},
+        'volume_profile': None,
         'notes': [],
     }
 
@@ -3467,6 +4617,9 @@ def build_optional_context(code: str, df: pd.DataFrame, demo: bool = False) -> d
         context['market_review']['market_status'] = '演示模式已跳过'
         context['news_sentiment']['source'] = '演示模式已跳过'
         context['consensus']['source'] = '演示模式已跳过'
+        context['options_data']['source'] = '演示模式已跳过'
+        # Volume Profile 可以在 demo 模式下计算
+        context['volume_profile'] = calc_anchored_volume_profile(df)
         return context
 
     try:
@@ -3479,6 +4632,18 @@ def build_optional_context(code: str, df: pd.DataFrame, demo: bool = False) -> d
     except Exception:
         context['chip_dist'] = {'source': '获取失败'}
 
+    # 获取期权数据
+    try:
+        context['options_data'] = fetch_options_data(code)
+    except Exception:
+        context['options_data'] = {'available': False, 'source': '获取失败'}
+
+    # 计算锚定筹码分布
+    try:
+        context['volume_profile'] = calc_anchored_volume_profile(df)
+    except Exception:
+        context['volume_profile'] = None
+
     return context
 
 
@@ -3490,6 +4655,11 @@ def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False,
     # 计算指标
     df = calculate_indicators(df)
     last = df.iloc[-1]
+
+    # ========== 0. 黑天鹅与熔断检查（最高优先级）==========
+    vol_exhaust_early = calc_volume_exhaustion(df)
+    hvn_zones_early = vol_exhaust_early.get('hvn_zones', [])
+    circuit_breaker = check_circuit_breaker(code, df, hvn_zones_early, demo=demo)
 
     # 验证指标计算结果
     is_valid, warnings = validate_indicators(df)
@@ -3523,6 +4693,37 @@ def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False,
     print(f"{'='*70}")
     for note in context['notes']:
         print(f"  说明: {note}")
+
+    # ========== 0. 熔断警告（最高优先级）==========
+    if circuit_breaker['any_triggered']:
+        print(f"\n{'='*70}")
+        print(f"  ║  ⚠⚠⚠  黑天鹅熔断 (Circuit Breaker)  ⚠⚠⚠              ║")
+        print(f"{'='*70}")
+
+        if circuit_breaker['macro_triggered']:
+            macro = circuit_breaker['macro_data']
+            bm = macro.get('benchmark', {})
+            vix = macro.get('vix', {})
+            print(f"\n  【大盘环境阻断】")
+            if bm.get('below_ma200') and bm.get('ma200'):
+                print(f"    基准指数: {bm['name']} = {bm['price']:.2f}")
+                print(f"    MA200: {bm['ma200']:.2f} (偏离: {bm['deviation_pct']:+.2f}%)")
+                print(f"    → 基准指数跌破 200 日均线")
+            if vix.get('spike'):
+                print(f"    VIX: {vix['current']:.2f} (日内变化: {vix['change_pct']:+.1f}%)")
+                print(f"    → VIX 日内飙升超过 15%")
+            print(f"\n    ⚠ 宏观风险熔断，全局禁止买入")
+
+        if circuit_breaker['gap_triggered']:
+            gap = circuit_breaker['gap_data']
+            print(f"\n  【个股跳空毁灭】")
+            print(f"    向下跳空: {gap['gap_size']:.2f} ({gap['gap_atr_ratio']:.1f}x ATR)")
+            if gap.get('breached_hvn'):
+                hvn = gap['breached_hvn']
+                print(f"    穿越 HVN: {hvn[0]:.2f}-{hvn[1]:.2f} (量比: {hvn[2]:.1f}x)")
+            print(f"\n    ⚠ 逻辑证伪，切勿接飞刀，观望或止损")
+
+        print(f"{'='*70}")
 
     # ========== 1. 大盘复盘 ==========
     print(f"\n【大盘复盘】")
@@ -3718,6 +4919,63 @@ def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False,
         print(f"  分析师数量: {consensus['analyst_count']}位")
     print(f"  数据来源: 基于{consensus['source']}汇总")
 
+    # ========== 5.1 锚定筹码分布 (Volume Profile) ==========
+    volume_profile = context.get('volume_profile')
+    if volume_profile and volume_profile.get('poc'):
+        anchor = volume_profile.get('anchor_info', {})
+        print(f"\n【锚定筹码分布 (Volume Profile)】")
+        print(f"  锚定点: {anchor.get('anchor_details', '未知')} ({anchor.get('anchor_date', '')})")
+        print(f"  距今: {anchor.get('days_since_anchor', 0)} 天")
+        print(f"  POC (控制点): {volume_profile['poc']:.2f}")
+        print(f"  VAH (价值区高点): {volume_profile['vah']:.2f}")
+        print(f"  VAL (价值区低点): {volume_profile['val']:.2f}")
+
+        if volume_profile.get('hvn_zones'):
+            print(f"  高成交量节点 (HVN):")
+            for lo, hi, ratio in volume_profile['hvn_zones'][:3]:
+                print(f"    • {lo:.2f} - {hi:.2f} (量比: {ratio:.1f}x)")
+
+        if volume_profile.get('support_levels'):
+            print(f"  VP支撑位: {', '.join(f'{s:.2f}' for s in volume_profile['support_levels'])}")
+        if volume_profile.get('resistance_levels'):
+            print(f"  VP压力位: {', '.join(f'{r:.2f}' for r in volume_profile['resistance_levels'])}")
+
+        print(f"  → {volume_profile.get('interpretation', '')}")
+
+    # ========== 5.2 期权数据 ==========
+    options_data = context.get('options_data', {})
+    if options_data.get('available'):
+        print(f"\n【期权数据分析】")
+        if options_data.get('iv') is not None:
+            iv_pct = options_data['iv'] * 100
+            print(f"  隐含波动率 (IV): {iv_pct:.1f}%")
+        if options_data.get('iv_rank') is not None:
+            print(f"  IV Rank: {options_data['iv_rank']:.1f}")
+        if options_data.get('put_call_ratio') is not None:
+            print(f"  P/C Ratio: {options_data['put_call_ratio']:.2f}")
+        print(f"  数据来源: {options_data.get('source', 'yfinance')}")
+
+        # 假突破检测
+        # 判断当前是否有突破（价格接近近期高点/低点）
+        recent_high = df['high'].tail(20).max()
+        recent_low = df['low'].tail(20).min()
+        current_price = df['close'].iloc[-1]
+
+        near_high = current_price >= recent_high * 0.98
+        near_low = current_price <= recent_low * 1.02
+
+        if near_high:
+            fake_out = detect_fake_breakout(df, options_data, 'up')
+            if fake_out['is_fake_breakout']:
+                print(f"\n  ⚠ 假突破警告: {fake_out['details']}")
+        elif near_low:
+            fake_out = detect_fake_breakout(df, options_data, 'down')
+            if fake_out['is_fake_breakout']:
+                print(f"\n  ⚠ 假跌破警告: {fake_out['details']}")
+    elif options_data.get('source') and '不支持' not in options_data.get('source', ''):
+        print(f"\n【期权数据分析】")
+        print(f"  {options_data.get('source', '暂无期权数据')}")
+
     # ========== 5.5 左侧交易信号 ==========
     print(f"\n{'='*70}")
     print(f"  ║           左侧交易信号 (逆势分析)                            ║")
@@ -3778,17 +5036,46 @@ def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False,
     print(f"\n  左侧综合评分: [{score_bar}] {score}分")
     print(f"  信号: {contrarian['signal_text']}")
 
-    # Position Advice
+    # Position Advice (波动率平价模型)
     pa = contrarian['position_advice']
-    if pa['initial_position'] > 0:
-        print(f"\n  仓位建议 (左侧入场、右侧确认):")
-        print(f"    第一步: 左侧试探仓 {pa['initial_position']}%")
-        print(f"    第二步: 右侧确认后加仓至 {pa['initial_position'] + pa['confirm_position']}%")
-        print(f"    确认条件: {', '.join(pa['confirm_conditions'])}")
-        if pa.get('stop_loss'):
-            print(f"    止损价: {pa['stop_loss']:.2f}")
+    position_info = pa.get('position_info')
+    chandelier_info = pa.get('chandelier_info')
+
+    if position_info and position_info.get('is_valid'):
+        print(f"\n  仓位建议 (波动率平价模型):")
+
+        # Chandelier Exit 止损计算
+        if chandelier_info and chandelier_info.get('long_stop'):
+            print(f"    Chandelier Exit 止损计算:")
+            print(f"      区间最高价({CHANDELIER_LOOKBACK}日): {chandelier_info['highest_high']:.2f}")
+            print(f"      ATR(14): {chandelier_info['atr']:.2f}")
+            print(f"      止损价: {chandelier_info['highest_high']:.2f} - ({chandelier_info['atr_multiplier']} × {chandelier_info['atr']:.2f}) = {position_info['stop_loss']:.2f}")
+            print(f"      止损幅度: {position_info['stop_loss_pct']*100:.1f}%")
+
+        # 风险控制参数
+        print(f"\n    风险控制参数:")
+        print(f"      账户规模: {DEFAULT_ACCOUNT_SIZE:,.0f} 元")
+        print(f"      单笔最大风险: {MAX_RISK_PER_TRADE*100:.1f}%")
+        print(f"      本次交易最大承担风险金额: {position_info['max_risk_amount']:,.0f} 元")
+
+        # 建议仓位
+        print(f"\n    建议仓位:")
+        print(f"      建议买入数量: {position_info['suggested_shares']} 股")
+        print(f"      仓位市值: {position_info['position_value']:,.0f} 元")
+        print(f"      占账户比例: {position_info['position_pct']:.1f}%")
+
+        if pa.get('confirm_conditions'):
+            print(f"\n    右侧确认条件: {', '.join(pa['confirm_conditions'])}")
+
+        # 波动率警告
+        if position_info.get('volatility_warning'):
+            print(f"\n    {position_info['volatility_warning']}")
+        if position_info.get('risk_reward_warning'):
+            print(f"    {position_info['risk_reward_warning']}")
     else:
         print(f"\n  仓位建议: 暂不建议左侧入场，等待更明确信号")
+        if position_info and position_info.get('risk_reward_warning'):
+            print(f"    {position_info['risk_reward_warning']}")
 
     # Risk Caveats
     if contrarian.get('caveats'):
@@ -3974,7 +5261,28 @@ def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False,
 
         if price_targets.get('risk_reward'):
             print(f"  风险报酬比: 1:{price_targets['risk_reward']}")
-        print(f"  建议仓位: {price_targets.get('position_size', 10)}%")
+
+        # 滑点复核
+        rr_slip = price_targets.get('risk_reward_after_slippage')
+        if rr_slip is not None:
+            print(f"  滑点复核 (买入+{SLIPPAGE_PCT*100:.1f}%, 止损-{SLIPPAGE_PCT*100:.1f}%): 调整后盈亏比 1:{rr_slip}")
+        if price_targets.get('slippage_ev_warning'):
+            print(f"    {price_targets['slippage_ev_warning']}")
+
+        # 波动率平价仓位信息
+        position_info = price_targets.get('position_info')
+        if position_info:
+            print(f"\n  仓位管理 (波动率平价模型):")
+            print(f"    本次交易最大承担风险金额: {position_info['max_risk_amount']:,.0f} 元")
+            print(f"    止损价: {position_info['stop_loss']:.2f} 元 (止损幅度: {position_info['stop_loss_pct']*100:.1f}%)")
+            print(f"    建议买入数量: {position_info['suggested_shares']} 股")
+
+            if position_info.get('liquidity_warning'):
+                print(f"    {position_info['liquidity_warning']}")
+            if position_info.get('volatility_warning'):
+                print(f"    {position_info['volatility_warning']}")
+            if position_info.get('risk_reward_warning'):
+                print(f"    {position_info['risk_reward_warning']}")
 
     except Exception as e:
         print(f"  计算买卖点失败")
@@ -3997,52 +5305,70 @@ def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False,
     except Exception as e:
         print(f"  生成检查清单失败")
 
-    # ========== 7. LLM决策仪表盘 ==========
-    _fund_flow = fund_flow if isinstance(fund_flow, dict) else {'signal': '未知', 'trend': '观望'}
-    _news_sentiment = news_sentiment if isinstance(news_sentiment, dict) else {'sentiment': '中性', 'sentiment_score': 0}
-
+    # ========== 7. SMC 决策仪表盘 (严格决策树) ==========
     print(f"\n{'='*70}")
-    print(f"  ║               LLM 决策仪表盘 (模拟)                         ║")
+    print(f"  ║               SMC 决策仪表盘 (严格决策树)                      ║")
     print(f"{'='*70}")
 
     try:
-        dashboard = generate_decision_dashboard(resonance, _fund_flow,
-                                                _news_sentiment,
-                                                consensus if consensus else {},
-                                                win_rate_info,
-                                                contrarian=contrarian)
+        # 计算派发模式和 Chandelier Exit
+        distribution = calc_distribution_patterns(df)
+        chandelier = calc_chandelier_exit(df)
 
-        print(f"  一句话结论:")
-        print(f"  {dashboard.get('core_conclusion', '综合分析中...')}")
-        print()
+        # 生成决策
+        dashboard = generate_decision_dashboard(df, price_targets, contrarian, distribution, chandelier, circuit_breaker=circuit_breaker)
 
-        # 评分条
-        bullish = dashboard.get('bullish_score', 50)
-        bearish = dashboard.get('bearish_score', 50)
+        # 输出决策
+        decision_text = dashboard.get('decision_text', '观望')
+        confidence = dashboard.get('confidence', 'LOW')
+        confidence_text = {'HIGH': '高', 'MEDIUM': '中', 'LOW': '低'}.get(confidence, '低')
 
-        # 绘制简单条形图
-        b_bar = "█" * (bullish // 5) + "░" * (20 - bullish // 5)
-        be_bar = "█" * (bearish // 5) + "░" * (20 - bearish // 5)
+        print(f"\n  最终决策: 【{decision_text}】 置信度: {confidence_text}")
 
-        print(f"  评分:  [{b_bar}] 看多 {bullish}分")
-        print(f"         [{be_bar}] 看空 {bearish}分")
-        print()
+        # 买入条件检查
+        print(f"\n  ── 买入条件 ──────────────────────────────────")
+        buy_conds = dashboard.get('buy_conditions', {})
+        buy_details = dashboard.get('buy_details', {})
 
-        verdict = dashboard.get('verdict', '震荡')
-        action = dashboard.get('action', '观望')
-        confidence = dashboard.get('confidence', '低')
+        for key, label, detail_key in [
+            ('choch_confirmed', 'ChoCh 确认', 'choch'),
+            ('price_testing_zone', '回踩确认', 'zone'),
+            ('risk_reward_valid', '盈亏比', 'risk_reward'),
+            ('zscore_valid', 'Z-Score', 'zscore')
+        ]:
+            status = "✓" if buy_conds.get(key, False) else "✗"
+            detail = buy_details.get(detail_key, '')
+            print(f"    [{status}] {label}: {detail}")
 
-        print(f"  行动建议: 【{action}】  置信度: {confidence}")
-        print()
+        # 卖出条件检查
+        print(f"\n  ── 卖出条件 ──────────────────────────────────")
+        sell_conds = dashboard.get('sell_conditions', {})
+        sell_details = dashboard.get('sell_details', {})
 
-        print(f"  影响因素:")
-        factors = dashboard.get('factors', {})
-        for key, value in factors.items():
-            icon = "▲" if '多' in str(value) or '涨' in str(value) or '流入' in str(value) else ("▼" if '空' in str(value) or '跌' in str(value) or '流出' in str(value) else "○")
-            print(f"    {key}  {icon} {value}")
+        for key, label, detail_key in [
+            ('stop_loss_triggered', '止损触发', 'stop_loss'),
+            ('distribution_detected', '派发识别', 'distribution')
+        ]:
+            status = "✓" if sell_conds.get(key, False) else "✗"
+            detail = sell_details.get(detail_key, '')
+            print(f"    [{status}] {label}: {detail}")
+
+        # 决策理由
+        reasoning = dashboard.get('reasoning', [])
+        if reasoning:
+            print(f"\n  决策理由:")
+            for reason in reasoning:
+                print(f"    • {reason}")
+
+        # 风险警告
+        warnings = dashboard.get('warnings', [])
+        if warnings:
+            print(f"\n  ⚠ 风险警告:")
+            for warning in warnings:
+                print(f"    • {warning}")
 
     except Exception as e:
-        print(f"  生成决策仪表盘失败")
+        print(f"  生成决策仪表盘失败: {e}")
 
     print(f"{'='*70}")
 
@@ -4072,6 +5398,12 @@ def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False,
         print(f"  {summary}")
 
     print(f"{'='*70}\n")
+
+    # 静默写入决策日志
+    try:
+        append_decision_log(code, df, price_targets, dashboard, context)
+    except Exception:
+        pass
 
 
 # ============ 批量分析与压力测试模块 ============
@@ -4126,16 +5458,18 @@ def analyze_portfolio(codes: list, period: str = 'd', days: int = 60, demo: bool
                 df_clean, code, resonance, sr_inst, contrarian, demo
             )
 
-            # 决策仪表盘
-            optional_ctx = build_optional_context(code, df_clean, demo)
+            # 决策仪表盘（含熔断检查）
+            chandelier = calc_chandelier_exit(df_clean)
+            vol_exhaust_p = calc_volume_exhaustion(df_clean)
+            hvn_zones_p = vol_exhaust_p.get('hvn_zones', [])
+            circuit_breaker_p = check_circuit_breaker(code, df_clean, hvn_zones_p, demo=demo)
             dashboard = generate_decision_dashboard(
-                resonance,
-                optional_ctx.get('fund_flow', {}),
-                optional_ctx.get('sentiment', {}),
-                optional_ctx.get('consensus', {}),
-                win_rate_info,
-                contrarian
+                df_clean, price_targets, contrarian, distribution, chandelier,
+                circuit_breaker=circuit_breaker_p
             )
+
+            # 可选上下文（用于结果存储）
+            optional_ctx = build_optional_context(code, df_clean, demo)
 
             # 压力测试
             stress_result = None
@@ -4238,11 +5572,18 @@ def generate_comparison_table(results: dict) -> pd.DataFrame:
             else:
                 choch_status = '无转折'
 
+            # 计算买入/卖出强度（基于条件满足数量）
+            buy_conds = dashboard.get('buy_conditions', {})
+            sell_conds = dashboard.get('sell_conditions', {})
+
+            buy_strength = sum(1 for v in buy_conds.values() if v) * 25  # 0-100
+            sell_strength = sum(1 for v in sell_conds.values() if v) * 50  # 0-100
+
             rows.append({
                 '股票代码': code,
                 '当前阶段': stage,
-                '多头强度': dashboard['bullish_score'],
-                '空头强度': dashboard['bearish_score'],
+                '多头强度': buy_strength,
+                '空头强度': sell_strength,
                 '共振信号': resonance['resonance'],
                 '左侧得分': contrarian['composite_score'],
                 'BoS状态': bos_status,
@@ -4468,6 +5809,74 @@ def print_portfolio_analysis(results: dict):
             demo=False,
             stress_test=(analysis.get('stress_result') is not None)
         )
+
+
+# ============ 执行日志 ============
+
+def append_decision_log(code: str, df: pd.DataFrame, price_targets: dict,
+                         dashboard: dict, context: dict):
+    """静默追加决策日志到 trading_decision_log.csv
+
+    每次脚本运行结束时调用，将结构化决策数据追加到本地 CSV 文件。
+    写入失败不影响主流程。
+    """
+    import csv
+    import os
+
+    try:
+        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'trading_decision_log.csv')
+
+        last = df.iloc[-1]
+
+        # 提取 IV
+        iv = ''
+        options_data = context.get('options_data', {}) if context else {}
+        if options_data.get('iv') is not None:
+            iv = options_data['iv']
+
+        # 提取 POC
+        poc = ''
+        vp = context.get('volume_profile') if context else None
+        if vp and vp.get('poc') is not None:
+            poc = vp['poc']
+
+        # 提取仓位信息
+        position_info = price_targets.get('position_info', {}) if price_targets else {}
+        suggested_shares = position_info.get('suggested_shares', '') if position_info else ''
+
+        # 提取熔断状态
+        cb = dashboard.get('circuit_breaker') if dashboard else None
+        cb_triggered = cb.get('any_triggered', False) if cb else False
+
+        row = {
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'code': code,
+            'date': str(last.get('date', '')),
+            'close': round(last['close'], 2),
+            'atr': round(last['ATR'], 2) if pd.notna(last.get('ATR')) else '',
+            'iv': iv,
+            'poc': poc,
+            'adv20': round(last['ADV20'], 0) if pd.notna(last.get('ADV20')) else '',
+            'buy_price': price_targets.get('buy_price', '') if price_targets else '',
+            'stop_loss': price_targets.get('stop_loss', '') if price_targets else '',
+            'target_price': price_targets.get('target_price', '') if price_targets else '',
+            'risk_reward': price_targets.get('risk_reward', '') if price_targets else '',
+            'risk_reward_after_slippage': price_targets.get('risk_reward_after_slippage', '') if price_targets else '',
+            'decision': dashboard.get('decision', '') if dashboard else '',
+            'action': dashboard.get('action', '') if dashboard else '',
+            'suggested_shares': suggested_shares,
+            'circuit_breaker': cb_triggered
+        }
+
+        file_exists = os.path.exists(log_path)
+        with open(log_path, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=row.keys())
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
+
+    except Exception:
+        pass  # 日志写入失败不影响主流程
 
 
 def main():
