@@ -1763,6 +1763,197 @@ def check_circuit_breaker(code: str, df: pd.DataFrame, hvn_zones: list,
     return result
 
 
+# ============ 长线风控函数 ============
+
+def calc_max_drawdown_analysis(df: pd.DataFrame) -> dict:
+    """历史最大回撤分析"""
+    try:
+        close = df['close']
+        cummax = close.cummax()
+        drawdown = (close - cummax) / cummax * 100
+        max_dd = float(drawdown.min())
+        ath = float(cummax.iloc[-1])
+        current = float(close.iloc[-1])
+        ath_distance = (current - ath) / ath * 100 if ath > 0 else 0
+        current_dd = float(drawdown.iloc[-1])
+
+        return {
+            'max_drawdown': round(max_dd, 1),
+            'ath': round(ath, 2),
+            'ath_distance': round(ath_distance, 1),
+            'current_drawdown': round(current_dd, 1),
+            'dd_buffer': round(current_dd - max_dd, 1),  # 距最大回撤还有多少空间
+            'available': True
+        }
+    except Exception:
+        return {'max_drawdown': 0, 'ath': 0, 'ath_distance': 0, 'current_drawdown': 0, 'dd_buffer': 0, 'available': False}
+
+
+def calc_relative_strength(code: str, df: pd.DataFrame) -> dict:
+    """相对强弱分析：对比基准指数（1年/3年）"""
+    default_result = {
+        'benchmark_name': '', 'stock_1y_return': None, 'benchmark_1y_return': None,
+        'relative_1y': None, 'stock_3y_return': None, 'benchmark_3y_return': None,
+        'relative_3y': None, 'signal': 'neutral', 'signal_text': '数据不足', 'available': False
+    }
+
+    try:
+        # 选择基准
+        normalized = normalize_symbol(code)
+        if normalized.endswith('.SS') or normalized.endswith('.SZ'):
+            benchmark_code, benchmark_name = '000300.SS', '沪深300'
+        elif normalized.endswith('.HK'):
+            benchmark_code, benchmark_name = '^HSI', '恒生指数'
+        else:
+            benchmark_code, benchmark_name = 'SPY', 'S&P 500'
+
+        # 获取基准周线数据（3年 ≈ 156周）
+        bm_df, err = safe_fetch_yfinance_chart(benchmark_code, 'w', 780)
+        if bm_df is None or bm_df.empty:
+            default_result['benchmark_name'] = benchmark_name
+            return default_result
+
+        stock_close = df['close']
+        bm_close = bm_df['close']
+
+        # 计算 1 年收益率（约 52 周）
+        stock_1y = None
+        bm_1y = None
+        relative_1y = None
+        if len(stock_close) >= 52 and len(bm_close) >= 52:
+            stock_1y = (stock_close.iloc[-1] / stock_close.iloc[-52] - 1) * 100
+            bm_1y = (bm_close.iloc[-1] / bm_close.iloc[-52] - 1) * 100
+            relative_1y = stock_1y - bm_1y
+
+        # 计算 3 年收益率（约 156 周）
+        stock_3y = None
+        bm_3y = None
+        relative_3y = None
+        if len(stock_close) >= 156 and len(bm_close) >= 156:
+            stock_3y = (stock_close.iloc[-1] / stock_close.iloc[-156] - 1) * 100
+            bm_3y = (bm_close.iloc[-1] / bm_close.iloc[-156] - 1) * 100
+            relative_3y = stock_3y - bm_3y
+
+        # 信号判定
+        signal = 'neutral'
+        signal_text = '相对强弱数据不足'
+
+        if relative_1y is not None and relative_3y is not None:
+            if relative_1y > 0 and relative_3y > 0:
+                signal = 'outperform'
+                signal_text = f'长期相对强势，1年和3年均跑赢{benchmark_name}'
+            elif relative_1y < 0 and relative_3y < 0:
+                signal = 'underperform'
+                signal_text = f'长期相对弱势，1年和3年均跑输{benchmark_name}，长线需谨慎'
+            elif relative_1y > 0:
+                signal = 'neutral'
+                signal_text = f'近1年跑赢但3年跑输{benchmark_name}，趋势改善中'
+            else:
+                signal = 'neutral'
+                signal_text = f'近1年跑输但3年跑赢{benchmark_name}，近期走弱'
+        elif relative_1y is not None:
+            if relative_1y > 0:
+                signal = 'outperform'
+                signal_text = f'近1年跑赢{benchmark_name}'
+            else:
+                signal = 'underperform'
+                signal_text = f'近1年跑输{benchmark_name}'
+
+        return {
+            'benchmark_name': benchmark_name,
+            'stock_1y_return': round(stock_1y, 1) if stock_1y is not None else None,
+            'benchmark_1y_return': round(bm_1y, 1) if bm_1y is not None else None,
+            'relative_1y': round(relative_1y, 1) if relative_1y is not None else None,
+            'stock_3y_return': round(stock_3y, 1) if stock_3y is not None else None,
+            'benchmark_3y_return': round(bm_3y, 1) if bm_3y is not None else None,
+            'relative_3y': round(relative_3y, 1) if relative_3y is not None else None,
+            'signal': signal,
+            'signal_text': signal_text,
+            'available': True
+        }
+
+    except Exception:
+        return default_result
+
+
+def calc_dca_zone(df: pd.DataFrame, valuation: dict, sr_data: dict) -> dict:
+    """长线定投建议区间（结合周线支撑+估值）"""
+    try:
+        current_price = float(df['close'].iloc[-1])
+        last = df.iloc[-1]
+
+        # 区间下限：MA50 或支撑位
+        ma50 = last.get('MA50')
+        support_levels = sr_data.get('support', [])
+
+        if pd.notna(ma50) and ma50 > 0:
+            zone_low = float(ma50)
+            low_reason = 'MA50 长线支撑'
+        elif support_levels:
+            zone_low = float(support_levels[0])
+            low_reason = '周线支撑位'
+        else:
+            zone_low = current_price * 0.9
+            low_reason = '当前价下方10%'
+
+        # 区间上限：MA20 或当前价
+        ma20 = last.get('MA20')
+        if pd.notna(ma20) and ma20 > 0:
+            zone_high = float(ma20)
+            high_reason = 'MA20'
+        else:
+            zone_high = current_price
+            high_reason = '当前价'
+
+        # 确保 zone_low < zone_high
+        if zone_low >= zone_high:
+            zone_low, zone_high = min(zone_low, zone_high), max(zone_low, zone_high)
+            if zone_low == zone_high:
+                zone_low = zone_high * 0.95
+
+        # 估值调整
+        pe_pct = valuation.get('pe_percentile') if valuation.get('available') else None
+        valuation_adjusted = False
+        adjust_reason = ''
+
+        if pe_pct is not None:
+            if pe_pct < 30:
+                # 低估：区间上移 5%（更积极）
+                zone_high = zone_high * 1.05
+                valuation_adjusted = True
+                adjust_reason = f'估值低估({pe_pct:.0f}%分位)，区间上移'
+            elif pe_pct > 70:
+                # 高估：区间下移 5%（更保守）
+                zone_high = zone_high * 0.95
+                zone_low = zone_low * 0.95
+                valuation_adjusted = True
+                adjust_reason = f'估值偏高({pe_pct:.0f}%分位)，区间下移'
+
+        zone_reason = f'{low_reason} ~ {high_reason}'
+        if adjust_reason:
+            zone_reason += f'，{adjust_reason}'
+
+        # 判断当前价位
+        if current_price < zone_low:
+            position_text = '低于区间，可积极建仓'
+        elif current_price > zone_high:
+            position_text = '高于区间，建议等待回调'
+        else:
+            position_text = '区间内，可分批建仓'
+
+        return {
+            'zone_low': round(zone_low, 2),
+            'zone_high': round(zone_high, 2),
+            'zone_reason': zone_reason,
+            'valuation_adjusted': valuation_adjusted,
+            'position_text': position_text,
+            'available': True
+        }
+
+    except Exception:
+        return {'zone_low': 0, 'zone_high': 0, 'zone_reason': '数据不足', 'valuation_adjusted': False, 'position_text': '', 'available': False}
+
+
 # ============ 仓位管理核心函数 ============
 
 def calc_chandelier_exit(df: pd.DataFrame, atr_multiplier: float = CHANDELIER_ATR_MULTIPLIER,
@@ -5867,42 +6058,63 @@ def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False,
             for instrument in hedge['hedge_instruments']:
                 print(f"    • {instrument}")
 
-    # ========== 6. 买卖点分析 + 检查清单 ==========
-    print(f"\n【买卖点分析】")
+    # ========== 6. 长线风控分析 + 定投建议 ==========
 
+    # 6.1 历史回撤分析
+    print(f"\n【长线风控分析】")
+    dd_analysis = calc_max_drawdown_analysis(df)
+    if dd_analysis.get('available'):
+        print(f"  历史最高价 (ATH): {dd_analysis['ath']:.2f}")
+        print(f"  距 ATH 跌幅: {dd_analysis['ath_distance']:+.1f}%")
+        print(f"  历史最大回撤: {dd_analysis['max_drawdown']:.1f}%")
+        print(f"  当前回撤位置: {dd_analysis['current_drawdown']:.1f}% (距最大回撤还有 {dd_analysis['dd_buffer']:.1f}% 空间)")
+    else:
+        print(f"  回撤数据不足")
+
+    # 6.2 相对强弱分析
+    print(f"\n【相对强弱分析】")
+    rs = calc_relative_strength(code, df)
+    if rs.get('available'):
+        print(f"  基准指数: {rs['benchmark_name']}")
+        if rs.get('relative_1y') is not None:
+            s1 = rs['stock_1y_return']
+            b1 = rs['benchmark_1y_return']
+            d1 = rs['relative_1y']
+            icon1 = '▲' if d1 > 0 else '▼'
+            print(f"  近 1 年: 股票 {s1:+.1f}% vs 基准 {b1:+.1f}% → {icon1} {'跑赢' if d1 > 0 else '跑输'} {abs(d1):.1f}%")
+        if rs.get('relative_3y') is not None:
+            s3 = rs['stock_3y_return']
+            b3 = rs['benchmark_3y_return']
+            d3 = rs['relative_3y']
+            icon3 = '▲' if d3 > 0 else '▼'
+            print(f"  近 3 年: 股票 {s3:+.1f}% vs 基准 {b3:+.1f}% → {icon3} {'跑赢' if d3 > 0 else '跑输'} {abs(d3):.1f}%")
+
+        signal_icon = {'outperform': '▲', 'underperform': '▼', 'neutral': '○'}.get(rs['signal'], '○')
+        print(f"\n  结论: {signal_icon} {rs['signal_text']}")
+    else:
+        print(f"  {rs.get('signal_text', '数据不足')}")
+
+    # 6.3 长线定投建议区间
+    print(f"\n【长线定投建议区间】")
     try:
         price_targets = calculate_price_targets(df, resonance, consensus, support, resistance, contrarian=contrarian)
-        print(f"  建议买入价: {price_targets['buy_price']:.2f}元 ({price_targets.get('buy_reason', '')})")
-        print(f"  建议止损价: {price_targets['stop_loss']:.2f}元 ({price_targets.get('stop_reason', '')})")
-        print(f"  目标价: {price_targets['target_price']:.2f}元 ({price_targets.get('target_reason', '')})")
+        valuation = fetch_valuation_metrics(code)
+        dca_zone = calc_dca_zone(df, valuation, sr_data)
 
-        if price_targets.get('risk_reward'):
-            print(f"  风险报酬比: 1:{price_targets['risk_reward']}")
-
-        # 滑点复核
-        rr_slip = price_targets.get('risk_reward_after_slippage')
-        if rr_slip is not None:
-            print(f"  滑点复核 (买入+{SLIPPAGE_PCT*100:.1f}%, 止损-{SLIPPAGE_PCT*100:.1f}%): 调整后盈亏比 1:{rr_slip}")
-        if price_targets.get('slippage_ev_warning'):
-            print(f"    {price_targets['slippage_ev_warning']}")
-
-        # 波动率平价仓位信息
-        position_info = price_targets.get('position_info')
-        if position_info:
-            print(f"\n  仓位管理 (波动率平价模型):")
-            print(f"    本次交易最大承担风险金额: {position_info['max_risk_amount']:,.0f} 元")
-            print(f"    止损价: {position_info['stop_loss']:.2f} 元 (止损幅度: {position_info['stop_loss_pct']*100:.1f}%)")
-            print(f"    建议买入数量: {position_info['suggested_shares']} 股")
-
-            if position_info.get('liquidity_warning'):
-                print(f"    {position_info['liquidity_warning']}")
-            if position_info.get('volatility_warning'):
-                print(f"    {position_info['volatility_warning']}")
-            if position_info.get('risk_reward_warning'):
-                print(f"    {position_info['risk_reward_warning']}")
-
-    except Exception as e:
-        print(f"  计算买卖点失败")
+        if dca_zone.get('available'):
+            print(f"  建议区间: {dca_zone['zone_low']:.2f} - {dca_zone['zone_high']:.2f}")
+            print(f"  区间依据: {dca_zone['zone_reason']}")
+            current_price = last['close']
+            if dca_zone['zone_low'] <= current_price <= dca_zone['zone_high']:
+                print(f"  当前价位: {current_price:.2f} (区间内，可分批建仓)")
+            elif current_price < dca_zone['zone_low']:
+                print(f"  当前价位: {current_price:.2f} (低于区间，积极建仓)")
+            else:
+                print(f"  当前价位: {current_price:.2f} (高于区间，等待回调)")
+        else:
+            print(f"  数据不足，无法计算定投区间")
+    except Exception:
+        print(f"  计算定投区间失败")
 
     # 操作检查清单
     print(f"\n【操作检查清单】")
