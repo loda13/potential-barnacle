@@ -578,6 +578,119 @@ def fetch_monthly_confirmation(code: str, demo: bool = False) -> dict:
         return default_result
 
 
+def fetch_valuation_metrics(code: str) -> dict:
+    """获取估值指标 (PE/PS 历史百分位)"""
+    default_result = {
+        'current_pe': None, 'current_ps': None,
+        'pe_percentile': None, 'ps_percentile': None,
+        'valuation_signal': 'fair', 'signal_text': '估值数据不可用',
+        'available': False, 'source': '无数据'
+    }
+
+    is_a_share = code.isdigit() and len(code) == 6
+
+    try:
+        import yfinance as yf
+        yf_code = normalize_symbol(code)
+        ticker = yf.Ticker(yf_code)
+
+        info = call_with_suppressed_output(lambda: ticker.info)
+        if not info:
+            return default_result
+
+        current_pe = info.get('trailingPE')
+        current_ps = info.get('priceToSalesTrailing12Months')
+
+        if current_pe and current_pe < 0:
+            current_pe = None
+
+        if not current_pe and not current_ps:
+            default_result['source'] = '该标的无估值数据'
+            return default_result
+
+        hist = call_with_suppressed_output(lambda: ticker.history(period='5y', interval='1wk'))
+        if hist is None or hist.empty or len(hist) < 52:
+            default_result['source'] = '历史数据不足'
+            return default_result
+
+        pe_percentile = None
+        ps_percentile = None
+
+        hist_prices = hist['Close'].dropna()
+        if len(hist_prices) == 0:
+            return default_result
+
+        current_price = hist_prices.iloc[-1]
+
+        # 计算历史 PE 分位数
+        if current_pe and current_pe > 0:
+            current_eps = current_price / current_pe
+            if current_eps > 0:
+                hist_pe = hist_prices / current_eps
+                hist_pe = hist_pe[hist_pe > 0]
+                if len(hist_pe) > 0:
+                    pe_percentile = float((hist_pe < current_pe).sum() / len(hist_pe) * 100)
+
+        # 计算历史 PS 分位数
+        if current_ps and current_ps > 0:
+            current_sps = current_price / current_ps
+            if current_sps > 0:
+                hist_ps = hist_prices / current_sps
+                hist_ps = hist_ps[hist_ps > 0]
+                if len(hist_ps) > 0:
+                    ps_percentile = float((hist_ps < current_ps).sum() / len(hist_ps) * 100)
+
+        # 估值信号判定
+        signal = 'fair'
+        signal_text = '估值合理'
+
+        if pe_percentile is not None and ps_percentile is not None:
+            if pe_percentile < 20 and ps_percentile < 30:
+                signal = 'undervalued'
+                signal_text = f'低估（PE {pe_percentile:.0f}%分位，PS {ps_percentile:.0f}%分位）'
+            elif pe_percentile > 80 or ps_percentile > 80:
+                signal = 'overvalued'
+                signal_text = f'高估（PE {pe_percentile:.0f}%分位，PS {ps_percentile:.0f}%分位）'
+            else:
+                signal_text = f'合理（PE {pe_percentile:.0f}%分位，PS {ps_percentile:.0f}%分位）'
+        elif pe_percentile is not None:
+            if pe_percentile < 20:
+                signal = 'undervalued'
+                signal_text = f'低估（PE {pe_percentile:.0f}%分位）'
+            elif pe_percentile > 80:
+                signal = 'overvalued'
+                signal_text = f'高估（PE {pe_percentile:.0f}%分位）'
+            else:
+                signal_text = f'合理（PE {pe_percentile:.0f}%分位）'
+        elif ps_percentile is not None:
+            if ps_percentile < 30:
+                signal = 'undervalued'
+                signal_text = f'低估（PS {ps_percentile:.0f}%分位）'
+            elif ps_percentile > 80:
+                signal = 'overvalued'
+                signal_text = f'高估（PS {ps_percentile:.0f}%分位）'
+            else:
+                signal_text = f'合理（PS {ps_percentile:.0f}%分位）'
+
+        data_years = round(len(hist_prices) / 52, 1)
+
+        return {
+            'current_pe': round(current_pe, 2) if current_pe else None,
+            'current_ps': round(current_ps, 2) if current_ps else None,
+            'pe_percentile': round(pe_percentile, 1) if pe_percentile is not None else None,
+            'ps_percentile': round(ps_percentile, 1) if ps_percentile is not None else None,
+            'valuation_signal': signal,
+            'signal_text': signal_text,
+            'data_years': data_years,
+            'available': True,
+            'source': 'yfinance' + (' (A股数据可能不完整)' if is_a_share else '')
+        }
+
+    except Exception:
+        default_result['source'] = '估值数据获取失败'
+        return default_result
+
+
 def fetch_analyst_consensus(code: str) -> dict:
     """获取分析师评级共识
 
@@ -5550,7 +5663,52 @@ def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False,
     elif dist_score >= 40:
         print(f"\n  ⚠️  注意: 出现派发迹象，密切关注")
 
-    # ========== 5.9 自适应周期参数 ==========
+    # ========== 5.9 估值水位 (PE/PS 历史分位数) ==========
+    print(f"\n{'='*70}")
+    print(f"  ║           估值水位 (PE/PS 历史分位数)                        ║")
+    print(f"{'='*70}")
+
+    valuation = fetch_valuation_metrics(code)
+    if valuation.get('available'):
+        print(f"\n  【当前估值】")
+        if valuation['current_pe'] is not None:
+            print(f"    动态市盈率 (PE): {valuation['current_pe']:.1f}")
+        if valuation['current_ps'] is not None:
+            print(f"    市销率 (PS): {valuation['current_ps']:.1f}")
+        print(f"    数据覆盖: {valuation.get('data_years', 0)} 年")
+
+        print(f"\n  【历史分位】")
+        if valuation['pe_percentile'] is not None:
+            print(f"    PE 百分位: {valuation['pe_percentile']:.1f}%")
+        if valuation['ps_percentile'] is not None:
+            print(f"    PS 百分位: {valuation['ps_percentile']:.1f}%")
+
+        # 估值信号
+        signal_icon = {'undervalued': '▼', 'fair': '○', 'overvalued': '▲'}.get(valuation['valuation_signal'], '○')
+        print(f"\n  【估值信号】")
+        print(f"    {signal_icon} {valuation['signal_text']}")
+
+        # 估值+筹码联合确认
+        hvn_zones = contrarian.get('volume_exhaustion', {}).get('hvn_zones', [])
+        current_price = last['close']
+        price_in_hvn = any(lo <= current_price <= hi for lo, hi, _ in hvn_zones)
+        pe_pct = valuation.get('pe_percentile')
+
+        print(f"\n  【估值+筹码联合确认】")
+        if price_in_hvn and pe_pct is not None and pe_pct < 30:
+            print(f"    ✓ 价格在底部筹码密集区 + PE 历史低估({pe_pct:.0f}%分位) → 高胜率长线买点")
+        elif price_in_hvn and pe_pct is not None and pe_pct < 50:
+            print(f"    ○ 价格在筹码密集区 + PE 估值合理({pe_pct:.0f}%分位) → 可关注")
+        elif price_in_hvn:
+            print(f"    ○ 价格在筹码密集区，但估值偏高 → 等待估值回落")
+        else:
+            print(f"    ✗ 估值+筹码联合条件未满足")
+
+        print(f"    数据来源: {valuation['source']}")
+    else:
+        print(f"\n  {valuation.get('source', '估值数据不可用')}")
+
+    # ========== 5.10 自适应周期参数 ==========
     print(f"\n{'='*70}")
     print(f"  ║           自适应周期参数 (四维度动态调整)                    ║")
     print(f"{'='*70}")
