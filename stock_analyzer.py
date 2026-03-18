@@ -404,6 +404,97 @@ def fetch_stock_data(code: str, period: str, days: int, retry: int = 2, demo: bo
     raise ValueError("多次重试后仍无法获取数据，请稍后再试")
 
 
+def fetch_weekly_confirmation(code: str, demo: bool = False) -> dict:
+    """
+    获取周线数据并判断周线趋势确认
+
+    Args:
+        code: 股票代码
+        demo: 是否使用演示数据
+
+    Returns:
+        dict: {
+            'weekly_trend': 'uptrend' | 'downtrend' | 'sideways',
+            'weekly_bos_signal': 1 | -1 | 0,
+            'weekly_choch_signal': 1 | -1 | 0,
+            'weekly_adx': float,
+            'explanation': str
+        }
+    """
+    default_result = {
+        'weekly_trend': 'sideways',
+        'weekly_bos_signal': 0,
+        'weekly_choch_signal': 0,
+        'weekly_adx': 0.0,
+        'explanation': '周线数据不足'
+    }
+
+    try:
+        # 获取周线数据（420天 ≈ 60周 ≈ 1年）
+        df_weekly = fetch_stock_data(code, period='w', days=420, demo=demo)
+
+        if df_weekly is None or len(df_weekly) < 30:
+            return default_result
+
+        # 计算周线指标
+        df_weekly = calculate_indicators(df_weekly)
+
+        if len(df_weekly) < 20:
+            return default_result
+
+        last_weekly = df_weekly.iloc[-1]
+
+        # 获取周线 BoS 和 ChoCh 信号
+        weekly_bos_signal = int(last_weekly.get('bos_signal', 0))
+        weekly_choch_signal = int(last_weekly.get('choch_signal', 0))
+        weekly_adx = float(last_weekly.get('ADX', 0.0))
+
+        if pd.isna(weekly_adx):
+            weekly_adx = 0.0
+
+        # 判断周线趋势
+        ma5 = last_weekly.get('MA5', 0)
+        ma10 = last_weekly.get('MA10', 0)
+        ma20 = last_weekly.get('MA20', 0)
+
+        if pd.notna(ma5) and pd.notna(ma10) and pd.notna(ma20):
+            if ma5 > ma10 > ma20:
+                weekly_trend = 'uptrend'
+                trend_text = '上升趋势'
+            elif ma5 < ma10 < ma20:
+                weekly_trend = 'downtrend'
+                trend_text = '下降趋势'
+            else:
+                weekly_trend = 'sideways'
+                trend_text = '震荡'
+        else:
+            weekly_trend = 'sideways'
+            trend_text = '震荡'
+
+        # 生成解释
+        explanation = f"周线{trend_text} (ADX={weekly_adx:.1f})"
+        if weekly_bos_signal == 1:
+            explanation += ", BoS看多"
+        elif weekly_bos_signal == -1:
+            explanation += ", BoS看空"
+
+        if weekly_choch_signal == 1:
+            explanation += ", ChoCh看多"
+        elif weekly_choch_signal == -1:
+            explanation += ", ChoCh看空"
+
+        return {
+            'weekly_trend': weekly_trend,
+            'weekly_bos_signal': weekly_bos_signal,
+            'weekly_choch_signal': weekly_choch_signal,
+            'weekly_adx': weekly_adx,
+            'explanation': explanation
+        }
+
+    except Exception:
+        return default_result
+
+
 def fetch_analyst_consensus(code: str) -> dict:
     """获取分析师评级共识
 
@@ -2013,14 +2104,31 @@ def generate_smc_decision_tree(df: pd.DataFrame, price_targets: dict,
 
     # ========== 买入条件检查 ==========
 
-    # 条件 1: ChoCh 确认（下降趋势中出现 Higher High）
+    # 多时间框架共振检查
+    weekly_confirm = df.attrs.get('weekly_confirmation', {})
+    weekly_resonance = False
+
+    if weekly_confirm:
+        daily_bos = last.get('bos_signal', 0)
+        daily_choch = last.get('choch_signal', 0)
+        weekly_bos = weekly_confirm.get('weekly_bos_signal', 0)
+        weekly_choch = weekly_confirm.get('weekly_choch_signal', 0)
+
+        # 共振条件：日线和周线同向
+        if (daily_bos == 1 and weekly_bos == 1) or \
+           (daily_choch == 1 and weekly_choch == 1):
+            weekly_resonance = True
+
+    # 条件 1: ChoCh 确认（下降趋势中出现 Higher High）+ 周线共振
     choch_signal = last.get('choch_signal', 0)
     choch_strength = last.get('choch_strength', 0)
-    choch_confirmed = (choch_signal == 1 and choch_strength > 50)
+    choch_confirmed = (choch_signal == 1 and choch_strength > 50 and weekly_resonance)
 
     choch_detail = ''
     if choch_confirmed:
-        choch_detail = f"看多 ChoCh 确认 (强度: {choch_strength:.1f})"
+        choch_detail = f"看多 ChoCh 确认 (强度: {choch_strength:.1f}, 周线共振)"
+    elif choch_signal == 1 and choch_strength > 50 and not weekly_resonance:
+        choch_detail = f"ChoCh 信号强但周线未共振 (强度: {choch_strength:.1f})"
     elif choch_signal == 1:
         choch_detail = f"ChoCh 信号弱 (强度: {choch_strength:.1f} < 50)"
     elif choch_signal == -1:
@@ -3484,6 +3592,173 @@ def calc_volatility_regime(df: pd.DataFrame) -> dict:
 # PLACEHOLDER_SR_AND_DIVERGENCE
 
 
+def calc_adaptive_params(df: pd.DataFrame, market_stage: str = '震荡整理') -> dict:
+    """
+    自适应周期参数计算中心 — 基于四维度动态调整所有周期参数
+
+    四维度：
+    1. 波动率制度（ATR百分位）
+    2. 趋势强度（ADX）
+    3. 流动性状态（量比 = 当日成交量/ADV20）
+    4. 市场阶段（筑底/启动/派发/下行/震荡）
+
+    Args:
+        df: OHLCV DataFrame（必须已计算 ATR, ADX, ADV20）
+        market_stage: 市场阶段（来自 determine_market_stage()）
+
+    Returns:
+        dict: 包含所有自适应周期参数和诊断信息
+    """
+    # 默认返回值（数据不足时使用固定周期）
+    default_result = {
+        'bos_lookback': 20, 'choch_lookback': 20, 'chandelier_lookback': 22,
+        'vol_exhaust_lookback': 20, 'divergence_lookback': 30,
+        'volatility_factor': 1.0, 'trend_factor': 1.0, 'liquidity_factor': 1.0,
+        'stage_offset': 0, 'composite_factor': 1.0,
+        'atr_percentile': 50.0, 'adx': 25.0, 'volume_ratio': 1.0,
+        'market_stage': market_stage, 'regime': 'normal',
+        'explanation': '数据不足，使用固定周期'
+    }
+
+    try:
+        if len(df) < 60:
+            return default_result
+
+        last = df.iloc[-1]
+
+        # ========== 维度1: 波动率制度 ==========
+        vol_regime = calc_volatility_regime(df)
+        atr_pct = vol_regime['atr_percentile']
+        regime = vol_regime['regime']
+
+        # 波动率缩放因子：挤压期用短周期，扩张期用长周期
+        if regime == 'squeeze':
+            volatility_factor = 0.5  # 挤压期：周期减半（20→10）
+        elif regime == 'pulse':
+            volatility_factor = 0.7  # 脉冲期：周期缩短30%
+        elif regime == 'expansion':
+            volatility_factor = 1.5  # 扩张期：周期延长50%
+        else:  # normal
+            if atr_pct < 30:
+                volatility_factor = 0.7
+            elif atr_pct > 70:
+                volatility_factor = 1.3
+            else:
+                volatility_factor = 1.0
+
+        # ========== 维度2: 趋势强度 ==========
+        adx = last.get('ADX', 25.0)
+        if pd.isna(adx):
+            adx = 25.0
+
+        # 趋势缩放因子：强趋势用长周期，弱趋势用短周期
+        if adx > 40:
+            trend_factor = 1.5  # 极强趋势：延长50%
+        elif adx > 25:
+            trend_factor = 1.2  # 强趋势：延长20%
+        elif adx < 15:
+            trend_factor = 0.6  # 极弱趋势：缩短40%
+        elif adx < 20:
+            trend_factor = 0.8  # 弱趋势：缩短20%
+        else:
+            trend_factor = 1.0
+
+        # ========== 维度3: 流动性状态 ==========
+        current_vol = last.get('volume', 0)
+        adv20 = last.get('ADV20', 0)
+
+        if adv20 > 0 and not pd.isna(adv20):
+            volume_ratio = current_vol / adv20
+        else:
+            volume_ratio = 1.0
+
+        # 流动性缩放因子：高流动性用短周期，低流动性用长周期
+        if volume_ratio > 2.0:
+            liquidity_factor = 0.7  # 高流动性：缩短30%
+        elif volume_ratio > 1.5:
+            liquidity_factor = 0.9
+        elif volume_ratio < 0.5:
+            liquidity_factor = 1.3  # 低流动性：延长30%
+        elif volume_ratio < 0.8:
+            liquidity_factor = 1.1
+        else:
+            liquidity_factor = 1.0
+
+        # ========== 维度4: 市场阶段 ==========
+        # 不同阶段的基础周期偏移（加法调整）
+        stage_offset_map = {
+            '左侧筑底': -5,    # 筑底期：缩短周期，捕捉早期信号
+            '右侧启动': 0,     # 启动期：标准周期
+            '高位派发': +5,    # 派发期：延长周期，避免假突破
+            '下行通道': +3,    # 下行期：延长周期，过滤噪音
+            '震荡整理': 0      # 震荡期：标准周期
+        }
+        stage_offset = stage_offset_map.get(market_stage, 0)
+
+        # ========== 综合缩放因子 ==========
+        # 加权平均：波动率40%，趋势30%，流动性30%
+        composite_factor = (
+            volatility_factor * 0.4 +
+            trend_factor * 0.3 +
+            liquidity_factor * 0.3
+        )
+
+        # 限制在 [0.5, 1.5] 范围内
+        composite_factor = max(0.5, min(1.5, composite_factor))
+
+        # ========== 计算自适应周期 ==========
+        # 基础周期 × 综合因子 + 阶段偏移
+        bos_base = 20
+        choch_base = 20
+        chandelier_base = 22
+        vol_exhaust_base = 20
+        divergence_base = 30
+
+        bos_lookback = int(bos_base * composite_factor + stage_offset)
+        choch_lookback = int(choch_base * composite_factor + stage_offset)
+        chandelier_lookback = int(chandelier_base * composite_factor + stage_offset)
+        vol_exhaust_lookback = int(vol_exhaust_base * composite_factor + stage_offset)
+        divergence_lookback = int(divergence_base * composite_factor + stage_offset)
+
+        # 确保最小值（避免周期过短）
+        bos_lookback = max(10, bos_lookback)
+        choch_lookback = max(10, choch_lookback)
+        chandelier_lookback = max(11, chandelier_lookback)
+        vol_exhaust_lookback = max(10, vol_exhaust_lookback)
+        divergence_lookback = max(15, divergence_lookback)
+
+        # 生成解释
+        regime_text_map = {
+            'squeeze': '挤压期',
+            'pulse': '脉冲期',
+            'expansion': '扩张期',
+            'normal': '正常'
+        }
+        explanation = f"{regime_text_map.get(regime, '正常波动')} + ADX={adx:.0f} + 量比={volume_ratio:.1f}x → 周期调整为 {composite_factor:.1f}x"
+
+        return {
+            'bos_lookback': bos_lookback,
+            'choch_lookback': choch_lookback,
+            'chandelier_lookback': chandelier_lookback,
+            'vol_exhaust_lookback': vol_exhaust_lookback,
+            'divergence_lookback': divergence_lookback,
+            'volatility_factor': round(volatility_factor, 2),
+            'trend_factor': round(trend_factor, 2),
+            'liquidity_factor': round(liquidity_factor, 2),
+            'stage_offset': stage_offset,
+            'composite_factor': round(composite_factor, 2),
+            'atr_percentile': round(atr_pct, 1),
+            'adx': round(adx, 1),
+            'volume_ratio': round(volume_ratio, 2),
+            'market_stage': market_stage,
+            'regime': regime,
+            'explanation': explanation
+        }
+
+    except Exception:
+        return default_result
+
+
 def find_support_resistance_institutional(df: pd.DataFrame) -> dict:
     """机构级支撑压力位分析 — Order Block、FVG、流动性扫荡检测。"""
     # 传统S/R作为基线
@@ -4681,8 +4956,32 @@ def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False,
     win_rate_info = calculate_win_rate(indicators, resonance, df)
     context = build_optional_context(code, df, demo=demo)
 
+    # 获取周线确认
+    weekly_confirmation = fetch_weekly_confirmation(code, demo=demo)
+    df.attrs['weekly_confirmation'] = weekly_confirmation
+
     # 左侧交易信号分析
     contrarian = calc_contrarian_signals(df)
+
+    # 计算自适应周期参数
+    distribution = calc_distribution_patterns(df)
+    market_stage = determine_market_stage(resonance, contrarian, distribution, last)
+    adaptive_params = calc_adaptive_params(df, market_stage)
+    df.attrs['adaptive_params'] = adaptive_params
+
+    # 使用自适应参数重新计算关键指标
+    try:
+        df = calc_break_of_structure(df, lookback=adaptive_params['bos_lookback'])
+    except Exception:
+        pass
+
+    try:
+        df = calc_change_of_character(df, lookback=adaptive_params['choch_lookback'])
+    except Exception:
+        pass
+
+    # 重新获取最新数据（因为 BoS/ChoCh 可能已更新）
+    last = df.iloc[-1]
 
     summary = generate_summary(df, trend, signals, support, resistance, resonance)
 
@@ -5212,7 +5511,104 @@ def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False,
     elif dist_score >= 40:
         print(f"\n  ⚠️  注意: 出现派发迹象，密切关注")
 
-    # ========== 5.9 压力测试 (如果启用) ==========
+    # ========== 5.9 自适应周期参数 ==========
+    print(f"\n{'='*70}")
+    print(f"  ║           自适应周期参数 (四维度动态调整)                    ║")
+    print(f"{'='*70}")
+
+    adaptive = df.attrs.get('adaptive_params', {})
+    if adaptive:
+        regime_text_map = {
+            'squeeze': '挤压期',
+            'pulse': '脉冲期',
+            'expansion': '扩张期',
+            'normal': '正常'
+        }
+        regime_text = regime_text_map.get(adaptive['regime'], '正常')
+
+        print(f"\n  【市场诊断】")
+        print(f"    市场阶段: {adaptive['market_stage']}")
+        print(f"    波动率制度: {regime_text} (ATR百分位: {adaptive['atr_percentile']:.1f}%)")
+        print(f"    趋势强度: ADX={adaptive['adx']:.1f}")
+        print(f"    流动性状态: 量比={adaptive['volume_ratio']:.2f}x")
+
+        print(f"\n  【缩放因子】")
+        print(f"    波动率维度: {adaptive['volatility_factor']:.2f}x (权重40%)")
+        print(f"    趋势维度: {adaptive['trend_factor']:.2f}x (权重30%)")
+        print(f"    流动性维度: {adaptive['liquidity_factor']:.2f}x (权重30%)")
+        print(f"    市场阶段偏移: {adaptive['stage_offset']:+d}天")
+        print(f"    综合缩放因子: {adaptive['composite_factor']:.2f}x")
+
+        print(f"\n  【调整后周期】")
+        print(f"    BoS/ChoCh 回溯期: {adaptive['bos_lookback']}天 (基础20天)")
+        print(f"    Chandelier Exit: {adaptive['chandelier_lookback']}天 (基础22天)")
+        print(f"    三重背离: {adaptive['divergence_lookback']}天 (基础30天)")
+
+        print(f"\n  说明: {adaptive['explanation']}")
+    else:
+        print(f"\n  数据不足，使用固定周期参数")
+
+    # ========== 5.10 多时间框架共振 ==========
+    print(f"\n{'='*70}")
+    print(f"  ║           多时间框架共振 (日线 × 周线)                       ║")
+    print(f"{'='*70}")
+
+    weekly = df.attrs.get('weekly_confirmation', {})
+    if weekly and weekly['weekly_trend'] != 'sideways':
+        trend_icon_map = {
+            'uptrend': '▲',
+            'downtrend': '▼',
+            'sideways': '○'
+        }
+        trend_icon = trend_icon_map.get(weekly['weekly_trend'], '○')
+
+        trend_text_map = {
+            'uptrend': '上升趋势',
+            'downtrend': '下降趋势',
+            'sideways': '震荡'
+        }
+        trend_text = trend_text_map.get(weekly['weekly_trend'], '震荡')
+
+        print(f"\n  【周线趋势】")
+        print(f"    趋势方向: {trend_icon} {trend_text}")
+        print(f"    周线 ADX: {weekly['weekly_adx']:.1f}")
+        print(f"    周线 BoS: {weekly['weekly_bos_signal']}")
+        print(f"    周线 ChoCh: {weekly['weekly_choch_signal']}")
+
+        # 判断共振
+        daily_bos = last.get('bos_signal', 0)
+        daily_choch = last.get('choch_signal', 0)
+        weekly_bos = weekly['weekly_bos_signal']
+        weekly_choch = weekly['weekly_choch_signal']
+
+        print(f"\n  【共振分析】")
+        print(f"    日线 BoS: {daily_bos}, 周线 BoS: {weekly_bos}")
+        print(f"    日线 ChoCh: {daily_choch}, 周线 ChoCh: {weekly_choch}")
+
+        # 共振条件：日线和周线同向
+        resonance_detected = False
+        if (daily_bos == 1 and weekly_bos == 1):
+            print(f"\n  ✓ BoS 多头共振确认 (日线+周线同步看多)")
+            resonance_detected = True
+        elif (daily_bos == -1 and weekly_bos == -1):
+            print(f"\n  ✓ BoS 空头共振确认 (日线+周线同步看空)")
+            resonance_detected = True
+
+        if (daily_choch == 1 and weekly_choch == 1):
+            print(f"\n  ✓ ChoCh 多头共振确认 (日线+周线同步看多)")
+            resonance_detected = True
+        elif (daily_choch == -1 and weekly_choch == -1):
+            print(f"\n  ✓ ChoCh 空头共振确认 (日线+周线同步看空)")
+            resonance_detected = True
+
+        if not resonance_detected:
+            print(f"\n  ✗ 日线与周线未共振，建议等待周线确认")
+
+        print(f"\n  说明: {weekly['explanation']}")
+    else:
+        print(f"\n  周线数据不足或处于震荡状态")
+
+    # ========== 5.11 压力测试 (如果启用) ==========
     if stress_test:
         print(f"\n{'='*70}")
         print(f"  ║           压力测试 (15% 回撤场景)                            ║")
@@ -5311,9 +5707,11 @@ def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False,
     print(f"{'='*70}")
 
     try:
-        # 计算派发模式和 Chandelier Exit
+        # 计算派发模式和 Chandelier Exit（使用自适应参数）
         distribution = calc_distribution_patterns(df)
-        chandelier = calc_chandelier_exit(df)
+        adaptive = df.attrs.get('adaptive_params', {})
+        chandelier_lookback = adaptive.get('chandelier_lookback', 22)
+        chandelier = calc_chandelier_exit(df, lookback=chandelier_lookback)
 
         # 生成决策
         dashboard = generate_decision_dashboard(df, price_targets, contrarian, distribution, chandelier, circuit_breaker=circuit_breaker)
@@ -5453,13 +5851,35 @@ def analyze_portfolio(codes: list, period: str = 'd', days: int = 60, demo: bool
             contrarian = calc_contrarian_signals(df_clean)
             distribution = calc_distribution_patterns(df_clean)
 
+            # 计算自适应周期参数
+            last_row = df_clean.iloc[-1]
+            market_stage = determine_market_stage(resonance, contrarian, distribution, last_row)
+            adaptive_params = calc_adaptive_params(df_clean, market_stage)
+            df_clean.attrs['adaptive_params'] = adaptive_params
+
+            # 使用自适应参数重新计算关键指标
+            try:
+                df_clean = calc_break_of_structure(df_clean, lookback=adaptive_params['bos_lookback'])
+            except Exception:
+                pass
+
+            try:
+                df_clean = calc_change_of_character(df_clean, lookback=adaptive_params['choch_lookback'])
+            except Exception:
+                pass
+
+            # 获取周线确认
+            weekly_confirmation = fetch_weekly_confirmation(code, demo=demo)
+            df_clean.attrs['weekly_confirmation'] = weekly_confirmation
+
             # 价格目标
             price_targets = calculate_price_targets(
                 df_clean, code, resonance, sr_inst, contrarian, demo
             )
 
-            # 决策仪表盘（含熔断检查）
-            chandelier = calc_chandelier_exit(df_clean)
+            # 决策仪表盘（含熔断检查，使用自适应参数）
+            chandelier_lookback = adaptive_params.get('chandelier_lookback', 22)
+            chandelier = calc_chandelier_exit(df_clean, lookback=chandelier_lookback)
             vol_exhaust_p = calc_volume_exhaustion(df_clean)
             hvn_zones_p = vol_exhaust_p.get('hvn_zones', [])
             circuit_breaker_p = check_circuit_breaker(code, df_clean, hvn_zones_p, demo=demo)
