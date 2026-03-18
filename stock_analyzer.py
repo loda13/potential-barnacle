@@ -17,6 +17,31 @@ from typing import Tuple, Dict, List, Optional, Callable, Any
 import pandas as pd
 import numpy as np
 
+# 长线基本面扫雷模块
+try:
+    from fundamentals import fetch_dilution_analysis, fetch_quality_metrics, check_delisting_risk, detect_value_trap
+except ImportError:
+    fetch_dilution_analysis = None
+    fetch_quality_metrics = None
+    check_delisting_risk = None
+    detect_value_trap = None
+
+# 聪明钱动向模块
+try:
+    from smart_money import fetch_insider_transactions, fetch_institutional_holdings, calc_smart_money_confirmation
+except ImportError:
+    fetch_insider_transactions = None
+    fetch_institutional_holdings = None
+    calc_smart_money_confirmation = None
+
+# 行业相对强弱与财报波动模块
+try:
+    from sector_analysis import calc_sector_relative_strength, fetch_earnings_volatility, check_structural_bear_market
+except ImportError:
+    calc_sector_relative_strength = None
+    fetch_earnings_volatility = None
+    check_structural_bear_market = None
+
 
 REQUEST_TIMEOUT = 10
 CHART_FETCH_BUFFER_DAYS = 1200  # 长线分析：支持 3-5 年历史数据
@@ -434,12 +459,16 @@ def fetch_weekly_confirmation(code: str, demo: bool = False) -> dict:
         'weekly_bos_signal': 0,
         'weekly_choch_signal': 0,
         'weekly_adx': 0.0,
+        'weekly_50ma': 0.0,
+        'weekly_200ma': 0.0,
+        'weekly_golden_cross': False,
+        'long_term_trend_health': 'unknown',
         'explanation': '周线数据不足'
     }
 
     try:
-        # 获取周线数据（420天 ≈ 60周 ≈ 1年）
-        df_weekly = fetch_stock_data(code, period='w', days=420, demo=demo)
+        # 获取周线数据（1500天 ≈ 215周，覆盖200周均线计算）
+        df_weekly = fetch_stock_data(code, period='w', days=1500, demo=demo)
 
         if df_weekly is None or len(df_weekly) < 30:
             return default_result
@@ -491,11 +520,42 @@ def fetch_weekly_confirmation(code: str, demo: bool = False) -> dict:
         elif weekly_choch_signal == -1:
             explanation += ", ChoCh看空"
 
+        # 计算50周/200周均线（长线趋势健康检查）
+        weekly_50ma = 0.0
+        weekly_200ma = 0.0
+        weekly_golden_cross = False
+        long_term_trend_health = 'unknown'
+
+        if len(df_weekly) >= 200:
+            weekly_50ma = float(df_weekly['close'].rolling(50).mean().iloc[-1])
+            weekly_200ma = float(df_weekly['close'].rolling(200).mean().iloc[-1])
+            if not pd.isna(weekly_50ma) and not pd.isna(weekly_200ma) and weekly_200ma > 0:
+                weekly_golden_cross = weekly_50ma > weekly_200ma
+                if weekly_golden_cross:
+                    long_term_trend_health = 'healthy'
+                    explanation += f" | 长线健康 (50W={weekly_50ma:.2f} > 200W={weekly_200ma:.2f})"
+                else:
+                    long_term_trend_health = 'broken'
+                    explanation += f" | ⚠ 长线破位 (50W={weekly_50ma:.2f} < 200W={weekly_200ma:.2f})"
+            else:
+                weekly_50ma = 0.0
+                weekly_200ma = 0.0
+        elif len(df_weekly) >= 50:
+            weekly_50ma = float(df_weekly['close'].rolling(50).mean().iloc[-1])
+            if pd.isna(weekly_50ma):
+                weekly_50ma = 0.0
+            long_term_trend_health = 'insufficient'
+            explanation += " | 200周均线数据不足"
+
         return {
             'weekly_trend': weekly_trend,
             'weekly_bos_signal': weekly_bos_signal,
             'weekly_choch_signal': weekly_choch_signal,
             'weekly_adx': weekly_adx,
+            'weekly_50ma': weekly_50ma,
+            'weekly_200ma': weekly_200ma,
+            'weekly_golden_cross': weekly_golden_cross,
+            'long_term_trend_health': long_term_trend_health,
             'explanation': explanation
         }
 
@@ -519,6 +579,7 @@ def fetch_monthly_confirmation(code: str, demo: bool = False) -> dict:
         'monthly_ma12': 0.0,
         'monthly_ma24': 0.0,
         'monthly_adx': 0.0,
+        'monthly_golden_cross': False,
         'explanation': '月线数据不足'
     }
 
@@ -566,11 +627,14 @@ def fetch_monthly_confirmation(code: str, demo: bool = False) -> dict:
 
         explanation = f"月线{trend_text} (MA10={monthly_ma10:.2f}, MA20={monthly_ma20:.2f})"
 
+        monthly_golden_cross = monthly_ma10 > monthly_ma20 if (monthly_ma10 > 0 and monthly_ma20 > 0) else False
+
         return {
             'monthly_trend': monthly_trend,
             'monthly_ma12': monthly_ma10,
             'monthly_ma24': monthly_ma20,
             'monthly_adx': monthly_adx,
+            'monthly_golden_cross': monthly_golden_cross,
             'explanation': explanation
         }
 
@@ -2703,10 +2767,16 @@ def generate_smc_decision_tree(df: pd.DataFrame, price_targets: dict,
 
 def generate_decision_dashboard(df: pd.DataFrame, price_targets: dict,
                                 contrarian: dict, distribution: dict,
-                                chandelier: dict, circuit_breaker: dict = None) -> dict:
+                                chandelier: dict, circuit_breaker: dict = None,
+                                long_term_context: dict = None) -> dict:
     """决策仪表盘 (基于 SMC + EV 严格决策树)
 
-    如果 circuit_breaker 触发，强制覆写一切买入信号。
+    否决优先级链：
+    1. 熔断（宏观风险/跳空证伪）→ 最高优先级
+    2. 长线趋势熔断（50W < 200W）→ 严格禁止买入
+    3. 价值陷阱否决（低估值+恶化基本面）→ 否决买入
+    4. 宏观熊市降级（大盘结构性熊市）→ 买入降级为观望
+    5. SMC 决策树 → 正常决策流程
 
     Returns:
         {
@@ -2722,7 +2792,8 @@ def generate_decision_dashboard(df: pd.DataFrame, price_targets: dict,
             'action': str,
             'verdict': str,
             'core_conclusion': str,
-            'circuit_breaker': dict
+            'circuit_breaker': dict,
+            'long_term_bear_mode': bool
         }
     """
     # 熔断检查（最高优先级，覆写一切）
@@ -2763,6 +2834,66 @@ def generate_decision_dashboard(df: pd.DataFrame, price_targets: dict,
             'verdict': override_text,
             'core_conclusion': f"⚠ 熔断: {override_text}",
             'circuit_breaker': circuit_breaker
+        }
+
+    # ===== 长线趋势熔断（优先级仅次于熔断）=====
+    ltc = long_term_context or {}
+    weekly_conf = ltc.get('weekly_confirmation', {})
+    monthly_conf = ltc.get('monthly_confirmation', {})
+    long_term_health = weekly_conf.get('long_term_trend_health', 'unknown')
+
+    if long_term_health == 'broken':
+        reasoning = []
+        warnings = []
+        w50 = weekly_conf.get('weekly_50ma', 0)
+        w200 = weekly_conf.get('weekly_200ma', 0)
+
+        if w50 > 0 and w200 > 0:
+            deviation = (w50 - w200) / w200 * 100
+            reasoning.append(f"50周均线({w50:.2f}) < 200周均线({w200:.2f})，偏离 {deviation:.1f}%")
+
+        override_text = '致命警告：长线结构性熊市，禁止买入'
+        monthly_also_broken = not monthly_conf.get('monthly_golden_cross', True)
+        if monthly_also_broken and monthly_conf.get('monthly_ma12', 0) > 0:
+            override_text = '致命警告：月线+周线双破位，严禁抄底'
+            reasoning.append(f"月线MA10({monthly_conf.get('monthly_ma12', 0):.2f}) < MA20({monthly_conf.get('monthly_ma24', 0):.2f})")
+
+        warnings.append('长线结构性熊市，全局禁止任何买入操作，等待50周均线重新站上200周均线')
+
+        return {
+            'decision': 'LONG_TERM_BEAR',
+            'decision_text': override_text,
+            'confidence': 'HIGH',
+            'buy_conditions': {},
+            'sell_conditions': {},
+            'buy_details': {},
+            'sell_details': {},
+            'reasoning': reasoning,
+            'warnings': warnings,
+            'action': '禁止买入',
+            'verdict': override_text,
+            'core_conclusion': f"⚠ 长线熔断: {override_text}",
+            'long_term_bear_mode': True
+        }
+
+    # ===== 价值陷阱否决 =====
+    fundamentals = ltc.get('fundamentals', {})
+    value_trap = fundamentals.get('value_trap', {})
+    if value_trap.get('is_trap') and value_trap.get('veto_buy'):
+        return {
+            'decision': 'VALUE_TRAP',
+            'decision_text': value_trap.get('warning_text', '价值陷阱警告：盈利能力恶化，否决买入'),
+            'confidence': 'HIGH',
+            'buy_conditions': {},
+            'sell_conditions': {},
+            'buy_details': {},
+            'sell_details': {},
+            'reasoning': value_trap.get('reasons', ['低估值 + 基本面恶化 = 价值陷阱']),
+            'warnings': [value_trap.get('warning_text', '价值陷阱警告')],
+            'action': '否决买入',
+            'verdict': '价值陷阱',
+            'core_conclusion': f"⚠ 价值陷阱: {value_trap.get('warning_text', '')}",
+            'long_term_bear_mode': False
         }
 
     smc = generate_smc_decision_tree(df, price_targets, contrarian, distribution, chandelier)
@@ -3877,6 +4008,105 @@ def calc_anchored_volume_profile(df: pd.DataFrame, value_area_pct: float = 0.7) 
             'support_levels': support_levels,
             'resistance_levels': resistance_levels,
             'interpretation': interpretation
+        }
+
+    except Exception:
+        return default_result
+
+
+def calc_macro_volume_profile(df: pd.DataFrame, value_area_pct: float = 0.7) -> dict:
+    """3年宏观筹码分布 — 使用完整历史数据（不依赖锚点），识别长线核心支撑/阻力区。
+
+    Args:
+        df: 完整 OHLCV DataFrame（建议 3-5 年日线数据）
+        value_area_pct: Value Area 包含的成交量比例，默认70%
+
+    Returns:
+        dict: 宏观 POC/VAH/VAL/HVN 及长线支撑阻力
+    """
+    default_result = {
+        'poc': None, 'vah': None, 'val': None,
+        'hvn_zones': [], 'lnv_zones': [],
+        'macro_support': [], 'macro_resistance': [],
+        'total_volume': 0, 'data_days': 0,
+        'interpretation': '数据不足，无法计算宏观筹码分布',
+        'available': False
+    }
+
+    if len(df) < 120:
+        return default_result
+
+    try:
+        vp_df = df.copy()
+        vp_df['typical_price'] = (vp_df['high'] + vp_df['low']) / 2
+
+        price_min = vp_df['low'].min()
+        price_max = vp_df['high'].max()
+
+        if price_max <= price_min:
+            return default_result
+
+        n_bins = min(150, max(30, len(vp_df) // 5))
+        bin_size = (price_max - price_min) / n_bins
+
+        bins_volume = []
+        for b in range(n_bins):
+            bin_low = price_min + b * bin_size
+            bin_high = bin_low + bin_size
+            bin_mid = (bin_low + bin_high) / 2
+            mask = (vp_df['typical_price'] >= bin_low) & (vp_df['typical_price'] < bin_high)
+            vol = vp_df.loc[mask, 'volume'].sum()
+            bins_volume.append({'low': bin_low, 'high': bin_high, 'mid': bin_mid, 'volume': vol})
+
+        total_volume = sum(b['volume'] for b in bins_volume)
+        if total_volume == 0:
+            return default_result
+
+        poc_bin = max(bins_volume, key=lambda x: x['volume'])
+        poc = poc_bin['mid']
+
+        sorted_bins = sorted(bins_volume, key=lambda x: x['volume'], reverse=True)
+        va_volume = 0
+        va_bins = []
+        target_va_volume = total_volume * value_area_pct
+        for b in sorted_bins:
+            va_bins.append(b)
+            va_volume += b['volume']
+            if va_volume >= target_va_volume:
+                break
+
+        vah = max(b['high'] for b in va_bins)
+        val = min(b['low'] for b in va_bins)
+
+        avg_volume = total_volume / n_bins
+        hvn_zones = []
+        lnv_zones = []
+        for b in bins_volume:
+            vol_ratio = b['volume'] / avg_volume if avg_volume > 0 else 0
+            if vol_ratio > 1.5:
+                hvn_zones.append((round(b['low'], 2), round(b['high'], 2), round(vol_ratio, 2)))
+            elif vol_ratio < 0.5:
+                lnv_zones.append((round(b['low'], 2), round(b['high'], 2), round(vol_ratio, 2)))
+
+        current_price = df.iloc[-1]['close']
+        macro_support = sorted([h[0] for h in hvn_zones if h[0] < current_price], reverse=True)[:5]
+        macro_resistance = sorted([h[1] for h in hvn_zones if h[1] > current_price])[:5]
+
+        data_years = len(df) / 250
+        interpretation = f'{data_years:.1f}年宏观筹码分布: POC={poc:.2f}'
+        if current_price > vah:
+            interpretation += f', 当前价({current_price:.2f})在宏观VA上方，历史高位套牢盘较少'
+        elif current_price < val:
+            interpretation += f', 当前价({current_price:.2f})在宏观VA下方，历史低位筹码密集区'
+        else:
+            interpretation += f', 当前价在宏观VA内 ({val:.2f}-{vah:.2f})'
+
+        return {
+            'poc': round(poc, 2), 'vah': round(vah, 2), 'val': round(val, 2),
+            'hvn_zones': hvn_zones, 'lnv_zones': lnv_zones,
+            'macro_support': macro_support, 'macro_resistance': macro_resistance,
+            'total_volume': total_volume, 'data_days': len(df),
+            'interpretation': interpretation, 'available': True
         }
 
     except Exception:
@@ -5218,6 +5448,10 @@ def build_optional_context(code: str, df: pd.DataFrame, demo: bool = False) -> d
         'consensus': {'rating': 'hold', 'rating_text': '暂无评级数据', 'target_price': None, 'analyst_count': 0, 'source': '为保障流程稳定已跳过'},
         'options_data': {'available': False, 'source': '已跳过'},
         'volume_profile': None,
+        'macro_vp': None,
+        'fundamentals': {'dilution': {}, 'quality': {}, 'delisting': {}, 'value_trap': {}},
+        'smart_money': {'insider': {}, 'institutional': {}, 'confirmation': {}},
+        'sector': {'rs': {}, 'earnings_vol': {}, 'macro_bear': {}},
         'notes': [],
     }
 
@@ -5230,6 +5464,7 @@ def build_optional_context(code: str, df: pd.DataFrame, demo: bool = False) -> d
         context['options_data']['source'] = '演示模式已跳过'
         # Volume Profile 可以在 demo 模式下计算
         context['volume_profile'] = calc_anchored_volume_profile(df)
+        context['macro_vp'] = calc_macro_volume_profile(df)
         return context
 
     try:
@@ -5253,6 +5488,62 @@ def build_optional_context(code: str, df: pd.DataFrame, demo: bool = False) -> d
         context['volume_profile'] = calc_anchored_volume_profile(df)
     except Exception:
         context['volume_profile'] = None
+
+    # 计算3年宏观筹码分布
+    try:
+        context['macro_vp'] = calc_macro_volume_profile(df)
+    except Exception:
+        context['macro_vp'] = None
+
+    # 基本面扫雷（稀释、质量、退市风险）
+    if fetch_dilution_analysis is not None:
+        try:
+            context['fundamentals']['dilution'] = fetch_dilution_analysis(code)
+        except Exception:
+            pass
+    if fetch_quality_metrics is not None:
+        try:
+            context['fundamentals']['quality'] = fetch_quality_metrics(code)
+        except Exception:
+            pass
+    if check_delisting_risk is not None:
+        try:
+            context['fundamentals']['delisting'] = check_delisting_risk(code, df)
+        except Exception:
+            pass
+
+    # 聪明钱动向（内部人士交易 + 机构持股）
+    if fetch_insider_transactions is not None:
+        try:
+            context['smart_money']['insider'] = fetch_insider_transactions(code)
+        except Exception:
+            pass
+    if fetch_institutional_holdings is not None:
+        try:
+            context['smart_money']['institutional'] = fetch_institutional_holdings(code)
+        except Exception:
+            pass
+
+    # 行业相对强弱
+    if calc_sector_relative_strength is not None:
+        try:
+            context['sector']['rs'] = calc_sector_relative_strength(code, df)
+        except Exception:
+            pass
+
+    # 财报波动统计
+    if fetch_earnings_volatility is not None:
+        try:
+            context['sector']['earnings_vol'] = fetch_earnings_volatility(code)
+        except Exception:
+            pass
+
+    # 宏观结构性熊市检查
+    if check_structural_bear_market is not None:
+        try:
+            context['sector']['macro_bear'] = check_structural_bear_market()
+        except Exception:
+            pass
 
     return context
 
@@ -6020,7 +6311,249 @@ def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False,
     else:
         print(f"\n  ✗ 多时间框架未共振，建议等待趋势同向确认")
 
-    # ========== 5.11 压力测试 (如果启用) ==========
+    # ========== 5.11 长线趋势健康检查 ==========
+    print(f"\n{'='*70}")
+    print(f"  ║           长线趋势健康检查 (50W/200W 均线)                   ║")
+    print(f"{'='*70}")
+
+    long_term_health = weekly.get('long_term_trend_health', 'unknown')
+    w50 = weekly.get('weekly_50ma', 0)
+    w200 = weekly.get('weekly_200ma', 0)
+    w_golden = weekly.get('weekly_golden_cross', False)
+
+    if long_term_health == 'broken':
+        print(f"\n  ⚠⚠⚠ 致命警告：长线结构性熊市，禁止买入！⚠⚠⚠")
+        print(f"\n  【50周/200周均线状态】")
+        if w50 > 0 and w200 > 0:
+            deviation = (w50 - w200) / w200 * 100
+            print(f"    50周均线: {w50:.2f}")
+            print(f"    200周均线: {w200:.2f}")
+            print(f"    偏离度: {deviation:.1f}%")
+            print(f"    状态: ✗ 死叉 (50W < 200W)")
+        print(f"\n  【月线趋势状态】")
+        m_golden = monthly.get('monthly_golden_cross', False)
+        if not m_golden and monthly.get('monthly_ma12', 0) > 0:
+            print(f"    月线MA10: {monthly.get('monthly_ma12', 0):.2f}")
+            print(f"    月线MA20: {monthly.get('monthly_ma24', 0):.2f}")
+            print(f"    状态: ✗ 月线也破位")
+            print(f"\n  ⚠ 月线+周线双破位，严禁抄底")
+        else:
+            print(f"    月线状态: {monthly.get('explanation', '未知')}")
+        print(f"\n  【趋势健康度评级】")
+        print(f"    评级: 破位 (Broken)")
+        print(f"    建议: 等待50周均线重新站上200周均线后再考虑")
+    elif long_term_health == 'healthy':
+        print(f"\n  ✓ 长线趋势健康")
+        print(f"\n  【50周/200周均线状态】")
+        if w50 > 0 and w200 > 0:
+            deviation = (w50 - w200) / w200 * 100
+            print(f"    50周均线: {w50:.2f}")
+            print(f"    200周均线: {w200:.2f}")
+            print(f"    偏离度: +{deviation:.1f}%")
+            print(f"    状态: ✓ 金叉 (50W > 200W)")
+        print(f"\n  【月线趋势状态】")
+        print(f"    {monthly.get('explanation', '未知')}")
+        print(f"\n  【趋势健康度评级】")
+        print(f"    评级: 健康 (Healthy)")
+        print(f"    建议: 长线趋势向上，可关注回调买点")
+    else:
+        print(f"\n  【50周/200周均线状态】")
+        print(f"    数据不足，无法计算200周均线")
+        print(f"    需要至少 1500 天历史数据")
+
+    # ========== 5.12 宏观筹码分布（3年）==========
+    macro_vp = context.get('macro_vp')
+    if macro_vp and macro_vp.get('available'):
+        print(f"\n{'='*70}")
+        print(f"  ║           宏观筹码分布（3年历史）                            ║")
+        print(f"{'='*70}")
+        print(f"\n  数据覆盖: {macro_vp['data_days']} 天 ({macro_vp['data_days']/250:.1f} 年)")
+        print(f"  POC (控制点): {macro_vp['poc']:.2f}")
+        print(f"  VAH (价值区高点): {macro_vp['vah']:.2f}")
+        print(f"  VAL (价值区低点): {macro_vp['val']:.2f}")
+
+        if macro_vp.get('macro_support'):
+            print(f"\n  历史长线核心支撑区:")
+            for i, s in enumerate(macro_vp['macro_support'][:5], 1):
+                print(f"    S{i}: {s:.2f}")
+
+        if macro_vp.get('macro_resistance'):
+            print(f"\n  历史长线核心阻力区:")
+            for i, r in enumerate(macro_vp['macro_resistance'][:5], 1):
+                print(f"    R{i}: {r:.2f}")
+
+        print(f"\n  → {macro_vp.get('interpretation', '')}")
+
+    # ========== 5.13 基本面体检 ==========
+    fundamentals = context.get('fundamentals', {})
+    dilution = fundamentals.get('dilution', {})
+    quality = fundamentals.get('quality', {})
+    delisting = fundamentals.get('delisting', {})
+
+    if dilution.get('available') or quality.get('available') or delisting.get('risk_level', 'none') != 'none':
+        print(f"\n{'='*70}")
+        print(f"  ║           基本面体检（稀释+质量+退市风险）                   ║")
+        print(f"{'='*70}")
+
+        # 估值水位（已在前面输出，这里引用）
+        if valuation.get('available'):
+            print(f"\n  【估值水位】")
+            if valuation['current_pe'] is not None:
+                print(f"    PE: {valuation['current_pe']:.1f} (历史 {valuation['pe_percentile']:.0f}% 分位)")
+            if valuation['current_ps'] is not None:
+                print(f"    PS: {valuation['current_ps']:.1f} (历史 {valuation['ps_percentile']:.0f}% 分位)")
+            print(f"    信号: {valuation['signal_text']}")
+
+        # 稀释检测
+        if dilution.get('available'):
+            print(f"\n  【稀释检测】")
+            print(f"    年化稀释率: {dilution['dilution_rate']:+.2f}%")
+            if dilution['severe_dilution']:
+                print(f"    ⚠ {dilution['warning_text']}")
+            elif dilution['warning_text']:
+                print(f"    {dilution['warning_text']}")
+            else:
+                print(f"    ✓ 流通股本稳定，无明显稀释")
+
+        # 质量检测
+        if quality.get('available'):
+            print(f"\n  【质量检测（ROE/FCF）】")
+            if quality['latest_roe'] is not None:
+                print(f"    最新 ROE: {quality['latest_roe']:.1f}%")
+            if quality['latest_fcf_margin'] is not None:
+                print(f"    最新 FCF 利润率: {quality['latest_fcf_margin']:.1f}%")
+            if quality['quality_deteriorating']:
+                print(f"    ⚠ {quality['warning_text']}")
+            elif quality['warning_text']:
+                print(f"    {quality['warning_text']}")
+            else:
+                print(f"    ✓ 盈利能力健康")
+
+        # 退市风险
+        if delisting.get('risk_level', 'none') != 'none':
+            print(f"\n  【退市风险】")
+            print(f"    风险等级: {delisting['risk_level'].upper()}")
+            if delisting['warning_text']:
+                print(f"    ⚠ {delisting['warning_text']}")
+            for detail in delisting.get('details', []):
+                print(f"    • {detail}")
+
+        # 价值陷阱判定
+        if detect_value_trap is not None:
+            try:
+                value_trap = detect_value_trap(valuation, quality)
+                if value_trap.get('is_trap'):
+                    print(f"\n  【价值陷阱判定】")
+                    print(f"    ⚠⚠⚠ {value_trap['warning_text']}")
+                    for reason in value_trap.get('reasons', []):
+                        print(f"    • {reason}")
+            except Exception:
+                pass
+
+    # ========== 5.14 聪明钱动向 ==========
+    smart_money = context.get('smart_money', {})
+    insider = smart_money.get('insider', {})
+    institutional = smart_money.get('institutional', {})
+
+    if insider.get('available') or institutional.get('available'):
+        print(f"\n{'='*70}")
+        print(f"  ║           聪明钱动向（内部人士+机构持股）                    ║")
+        print(f"{'='*70}")
+
+        # 内部人士交易
+        if insider.get('available'):
+            print(f"\n  【内部人士交易（近6月）】")
+            print(f"    买入次数: {insider['total_buys']}  |  卖出次数: {insider['total_sells']}")
+            activity_map = {'net_buying': '净买入', 'net_selling': '净卖出', 'mixed': '买卖交替'}
+            print(f"    净活动: {activity_map.get(insider['net_activity'], '未知')}")
+
+            if insider['large_sells']:
+                print(f"\n    大额卖出（> $1M）:")
+                for sell in insider['large_sells'][:5]:
+                    print(f"      • {sell['name']} ({sell['title']}): ${sell['value']:,.0f} ({sell['date']})")
+
+            if insider['insider_selling_alert']:
+                print(f"\n    ⚠ {insider['alert_text']}")
+            elif insider['alert_text']:
+                print(f"    {insider['alert_text']}")
+
+        # 机构持股
+        if institutional.get('available'):
+            print(f"\n  【机构持股】")
+            print(f"    机构数量: {institutional['total_holders']}")
+            if institutional['top_holders']:
+                print(f"    前5大机构:")
+                for h in institutional['top_holders'][:5]:
+                    pct = f"{h['pct_out']:.2f}%" if h['pct_out'] else ''
+                    print(f"      • {h['name']}: {pct}")
+
+        # 聪明钱综合确认
+        if calc_smart_money_confirmation is not None:
+            try:
+                macro_support_levels = context.get('macro_vp', {}).get('macro_support', [])
+                current_price = df.iloc[-1]['close']
+                at_support = any(abs(current_price - s) / current_price < 0.05 for s in macro_support_levels)
+                confirmation = calc_smart_money_confirmation(insider, institutional, at_support)
+                level_icon = {'high': '✓✓', 'medium': '✓', 'low': '○', 'warning': '⚠'}.get(confirmation['confirmation_level'], '○')
+                print(f"\n  【聪明钱综合判定】")
+                print(f"    {level_icon} {confirmation['signal_text']}")
+                for d in confirmation['details']:
+                    print(f"    • {d}")
+            except Exception:
+                pass
+
+    # ========== 5.15 行业相对强弱与宏观风控 ==========
+    sector = context.get('sector', {})
+    rs = sector.get('rs', {})
+    earnings_vol = sector.get('earnings_vol', {})
+    macro_bear = sector.get('macro_bear', {})
+
+    if rs.get('available') or earnings_vol.get('available') or macro_bear.get('available'):
+        print(f"\n{'='*70}")
+        print(f"  ║           行业相对强弱与宏观风控                             ║")
+        print(f"{'='*70}")
+
+        # 行业 RS 线
+        if rs.get('available'):
+            print(f"\n  【行业相对强弱】")
+            print(f"    对比标的: {rs['sector_name']}")
+            print(f"    1年RS变化: {rs['rs_1y_change']:+.2f}%")
+            if rs['rs_divergence']:
+                print(f"    ⚠ {rs['warning_text']}")
+            elif rs['warning_text']:
+                print(f"    {rs['warning_text']}")
+            if rs.get('is_fallback'):
+                print(f"    ⚠ 行业匹配失败，已降级为大盘宏观相对强弱对比")
+
+        # 财报波动统计
+        if earnings_vol.get('available'):
+            print(f"\n  【财报波动统计（近8次）】")
+            print(f"    平均跳空: {earnings_vol['avg_gap']:.1f}%  |  最大跳空: {earnings_vol['max_gap']:.1f}%")
+            print(f"    平均日内回撤: {earnings_vol['avg_drawdown']:.1f}%  |  最大回撤: {earnings_vol['max_drawdown']:.1f}%")
+            print(f"    {earnings_vol['summary_text']}")
+
+        # 宏观结构性熊市
+        if macro_bear.get('available'):
+            print(f"\n  【宏观结构性熊市检查】")
+            for name, data in macro_bear['indices'].items():
+                status = '✓' if data['above_ma200'] else '✗'
+                slope_icon = '↑' if data['ma200_slope'] > 0 else '↓'
+                print(f"    {status} {name}: ${data['price']:.2f} (MA200: ${data['ma200']:.2f}, 斜率: {slope_icon}{data['ma200_slope']:+.2f}%)")
+            if macro_bear['structural_bear']:
+                print(f"\n    ⚠ {macro_bear['warning_text']}")
+
+    # 如果触发长线熊市模式，跳过所有短线分析
+    if long_term_health == 'broken':
+        print(f"\n{'='*70}")
+        print(f"  ║  ⚠ 长线熊市模式：已跳过所有短线分析                         ║")
+        print(f"{'='*70}")
+        print(f"\n  说明: 50周均线 < 200周均线，长线结构性熊市")
+        print(f"  已跳过: 日线SMC买入条件、支撑阻力位、短线盈亏比、左侧/右侧信号、仓位建议")
+        print(f"  建议: 等待周线金叉后再考虑，或关注基本面是否出现拐点")
+        print(f"\n{'='*70}\n")
+        return  # 提前结束，不输出短线分析
+
+    # ========== 5.13 压力测试 (如果启用) ==========
     if stress_test:
         print(f"\n{'='*70}")
         print(f"  ║           压力测试 (15% 回撤场景)                            ║")
@@ -6147,7 +6680,28 @@ def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False,
         chandelier = calc_chandelier_exit(df, lookback=chandelier_lookback)
 
         # 生成决策
-        dashboard = generate_decision_dashboard(df, price_targets, contrarian, distribution, chandelier, circuit_breaker=circuit_breaker)
+        # 计算价值陷阱（用于决策仪表盘否决）
+        value_trap_result = {}
+        if detect_value_trap is not None:
+            try:
+                value_trap_result = detect_value_trap(valuation, context.get('fundamentals', {}).get('quality', {}))
+            except Exception:
+                pass
+
+        long_term_context = {
+            'weekly_confirmation': weekly_confirmation,
+            'monthly_confirmation': monthly_confirmation,
+            'valuation': valuation,
+            'fundamentals': {
+                **context.get('fundamentals', {}),
+                'value_trap': value_trap_result
+            },
+            'smart_money': context.get('smart_money', {}),
+            'sector_rs': context.get('sector', {}).get('rs', {})
+        }
+        dashboard = generate_decision_dashboard(df, price_targets, contrarian, distribution, chandelier,
+                                                circuit_breaker=circuit_breaker,
+                                                long_term_context=long_term_context)
 
         # 输出决策
         decision_text = dashboard.get('decision_text', '观望')
@@ -6310,8 +6864,9 @@ def analyze_portfolio(codes: list, period: str = 'w', days: int = 1000, demo: bo
             df_clean.attrs['monthly_confirmation'] = monthly_confirmation
 
             # 价格目标
+            consensus = {'rating': 'hold', 'rating_text': '暂无', 'target_price': None, 'analyst_count': 0, 'source': '批量模式'}
             price_targets = calculate_price_targets(
-                df_clean, code, resonance, sr_inst, contrarian, demo
+                df_clean, resonance, consensus, sr_inst['support'], sr_inst['resistance'], contrarian=contrarian
             )
 
             # 决策仪表盘（含熔断检查，使用自适应参数）
@@ -6322,7 +6877,11 @@ def analyze_portfolio(codes: list, period: str = 'w', days: int = 1000, demo: bo
             circuit_breaker_p = check_circuit_breaker(code, df_clean, hvn_zones_p, demo=demo)
             dashboard = generate_decision_dashboard(
                 df_clean, price_targets, contrarian, distribution, chandelier,
-                circuit_breaker=circuit_breaker_p
+                circuit_breaker=circuit_breaker_p,
+                long_term_context={
+                    'weekly_confirmation': weekly_confirmation,
+                    'monthly_confirmation': monthly_confirmation,
+                }
             )
 
             # 可选上下文（用于结果存储）
