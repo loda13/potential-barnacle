@@ -5430,7 +5430,7 @@ def analyze_portfolio(codes: list, period: str = 'd', days: int = 60, demo: bool
         print(f"[{idx}/{len(codes)}] 正在分析 {code}...")
         try:
             # 获取数据
-            df = fetch_stock_data(code, period, days, demo)
+            df = fetch_stock_data(code, period, days, demo=demo)
             if df.empty:
                 results[code] = {'error': '无法获取数据'}
                 continue
