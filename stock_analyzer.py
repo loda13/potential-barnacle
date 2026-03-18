@@ -19,7 +19,7 @@ import numpy as np
 
 
 REQUEST_TIMEOUT = 10
-CHART_FETCH_BUFFER_DAYS = 320
+CHART_FETCH_BUFFER_DAYS = 1200  # 长线分析：支持 3-5 年历史数据
 
 # ============ 仓位管理参数 ============
 MAX_RISK_PER_TRADE = 0.02      # 每笔交易最大风险比例 (1-2%)
@@ -87,20 +87,23 @@ def parse_chart_response(data: dict, code: str, period: str, days: int) -> Tuple
         return None, f"无有效数据: {code}"
 
     if period == 'w':
-        weekly = (
-            df.set_index('date')
-            .resample('W-FRI')
-            .agg({
-                'open': 'first',
-                'high': 'max',
-                'low': 'min',
-                'close': 'last',
-                'volume': 'sum',
-            })
-            .dropna()
-            .reset_index()
-        )
-        df = clean_stock_data(weekly)
+        # 周线数据：API 已通过 interval='1wk' 返回周线数据
+        # 仅在 API 返回日线时才 resample（兼容旧逻辑）
+        if len(df) > days * 3:
+            weekly = (
+                df.set_index('date')
+                .resample('W-FRI')
+                .agg({
+                    'open': 'first',
+                    'high': 'max',
+                    'low': 'min',
+                    'close': 'last',
+                    'volume': 'sum',
+                })
+                .dropna()
+                .reset_index()
+            )
+            df = clean_stock_data(weekly)
 
     df = df.tail(days).reset_index(drop=True)
     if df.empty:
@@ -218,7 +221,7 @@ def validate_indicators(df: pd.DataFrame) -> Tuple[bool, List[str]]:
 
     # 检查关键指标是否为NaN
     nan_indicators = []
-    for col in ['MA5', 'MA10', 'MA20', 'RSI', 'MACD', 'KDJ_K', 'ADX', 'ATR']:
+    for col in ['MA5', 'MA10', 'MA20', 'MA50', 'MA200', 'RSI', 'MACD', 'ADX', 'ATR']:
         if col in df.columns and pd.isna(last[col]):
             nan_indicators.append(col)
     if nan_indicators:
@@ -229,11 +232,7 @@ def validate_indicators(df: pd.DataFrame) -> Tuple[bool, List[str]]:
         if last['RSI'] < 0 or last['RSI'] > 100:
             warnings.append(f"RSI值异常: {last['RSI']:.2f} (应在0-100之间)")
 
-    # KDJ范围检查 (通常0-100，允许略微超出)
-    for col in ['KDJ_K', 'KDJ_D', 'KDJ_J']:
-        if col in df.columns and pd.notna(last[col]):
-            if last[col] < -20 or last[col] > 120:
-                warnings.append(f"{col}值异常: {last[col]:.2f}")
+    # KDJ 已移除
 
     # ADX范围检查 (0-100)
     if 'ADX' in df.columns and pd.notna(last['ADX']):
@@ -261,10 +260,19 @@ def safe_fetch_yfinance_chart(code: str, period: str, days: int) -> Tuple[Option
         start_time = end_time - get_history_window_days(period, days) * 86400
 
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_code}"
+
+        # 根据周期动态设置 interval
+        interval_map = {
+            'd': '1d',
+            'w': '1wk',
+            'm': '1mo'
+        }
+        interval = interval_map.get(period, '1d')
+
         params = {
             'period1': start_time,
             'period2': end_time,
-            'interval': '1d',
+            'interval': interval,
             'events': 'history'
         }
         headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'}
@@ -488,6 +496,81 @@ def fetch_weekly_confirmation(code: str, demo: bool = False) -> dict:
             'weekly_bos_signal': weekly_bos_signal,
             'weekly_choch_signal': weekly_choch_signal,
             'weekly_adx': weekly_adx,
+            'explanation': explanation
+        }
+
+    except Exception:
+        return default_result
+
+
+def fetch_monthly_confirmation(code: str, demo: bool = False) -> dict:
+    """
+    获取月线数据并判断月线趋势确认
+
+    Args:
+        code: 股票代码
+        demo: 是否使用演示数据
+
+    Returns:
+        dict: 月线趋势确认信息
+    """
+    default_result = {
+        'monthly_trend': 'sideways',
+        'monthly_ma12': 0.0,
+        'monthly_ma24': 0.0,
+        'monthly_adx': 0.0,
+        'explanation': '月线数据不足'
+    }
+
+    try:
+        # 获取月线数据（1800天 ≈ 60个月 ≈ 5年）
+        df_monthly = fetch_stock_data(code, period='m', days=1800, demo=demo)
+
+        if df_monthly is None or len(df_monthly) < 24:
+            return default_result
+
+        # 计算月线指标
+        df_monthly = calculate_indicators(df_monthly)
+
+        if len(df_monthly) < 12:
+            return default_result
+
+        last_monthly = df_monthly.iloc[-1]
+
+        # 获取月线均线（MA10≈10月, MA20≈20月）和 ADX
+        monthly_ma10 = float(last_monthly.get('MA10', 0.0))
+        monthly_ma20 = float(last_monthly.get('MA20', 0.0))
+        monthly_adx = float(last_monthly.get('ADX', 0.0))
+
+        if pd.isna(monthly_ma10):
+            monthly_ma10 = 0.0
+        if pd.isna(monthly_ma20):
+            monthly_ma20 = 0.0
+        if pd.isna(monthly_adx):
+            monthly_adx = 0.0
+
+        # 判断月线趋势
+        if monthly_ma10 > 0 and monthly_ma20 > 0:
+            if monthly_ma10 > monthly_ma20:
+                monthly_trend = 'uptrend'
+                trend_text = '上升趋势'
+            elif monthly_ma10 < monthly_ma20:
+                monthly_trend = 'downtrend'
+                trend_text = '下降趋势'
+            else:
+                monthly_trend = 'sideways'
+                trend_text = '震荡'
+        else:
+            monthly_trend = 'sideways'
+            trend_text = '震荡'
+
+        explanation = f"月线{trend_text} (MA10={monthly_ma10:.2f}, MA20={monthly_ma20:.2f})"
+
+        return {
+            'monthly_trend': monthly_trend,
+            'monthly_ma12': monthly_ma10,
+            'monthly_ma24': monthly_ma20,
+            'monthly_adx': monthly_adx,
             'explanation': explanation
         }
 
@@ -1946,26 +2029,29 @@ def generate_checklist(df: pd.DataFrame, resonance: dict, signals: dict,
     last = df.iloc[-1]
     results = []
 
-    # 1. MA多头排列
-    ma5 = last.get('MA5')
-    ma10 = last.get('MA10')
-    ma20 = last.get('MA20')
+    # 1. 长线均线趋势（MA50/MA200）
+    ma50 = last.get('MA50')
+    ma200 = last.get('MA200')
+    close = last.get('close')
 
-    if pd.notna(ma5) and pd.notna(ma10) and pd.notna(ma20):
-        is_bullish = ma5 > ma10 > ma20
-        reason = f"MA5>{ma10:.1f}>MA20{ma10:.1f}" if is_bullish else "非多头排列"
-        results.append(("MA均线多头排列", is_bullish, reason))
+    if pd.notna(ma50) and pd.notna(ma200) and pd.notna(close):
+        is_bullish = close > ma50 > ma200
+        if is_bullish:
+            reason = f"价格{close:.1f}>MA50{ma50:.1f}>MA200{ma200:.1f}"
+        else:
+            reason = f"未满足长线多头排列"
+        results.append(("长线均线多头排列", is_bullish, reason))
     else:
-        results.append(("MA均线多头排列", False, "数据不足"))
+        results.append(("长线均线多头排列", False, "数据不足"))
 
-    # 2. 乖离率
-    if pd.notna(ma20):
-        bias = (last['close'] - ma20) / ma20 * 100
-        is_ok = abs(bias) < 8
+    # 2. 乖离率（基于MA50）
+    if pd.notna(ma50):
+        bias = (last['close'] - ma50) / ma50 * 100
+        is_ok = abs(bias) < 15  # 长线放宽至15%
         reason = f"乖离率{bias:.1f}%" if is_ok else f"乖离率过高({bias:.1f}%)"
-        results.append(("乖离率合理(<8%)", is_ok, reason))
+        results.append(("乖离率合理(<15%)", is_ok, reason))
     else:
-        results.append(("乖离率合理(<8%)", False, "MA20数据不足"))
+        results.append(("乖离率合理(<15%)", False, "MA50数据不足"))
 
     # 3. RSI未超买
     rsi = last.get('RSI')
@@ -1977,13 +2063,7 @@ def generate_checklist(df: pd.DataFrame, resonance: dict, signals: dict,
         results.append(("RSI未超买(<75)", False, "RSI数据不足"))
 
     # 4. KDJ未超买
-    kdj_j = last.get('KDJ_J')
-    if pd.notna(kdj_j):
-        is_ok = kdj_j < 85
-        reason = f"KDJ_J={kdj_j:.1f}" if is_ok else f"KDJ超买({kdj_j:.1f})"
-        results.append(("KDJ未超买(<85)", is_ok, reason))
-    else:
-        results.append(("KDJ未超买(<85)", False, "KDJ数据不足"))
+    # KDJ 已移除（长线投资不需要）
 
     # 5. MACD多头运行
     macd = last.get('MACD')
@@ -2104,31 +2184,39 @@ def generate_smc_decision_tree(df: pd.DataFrame, price_targets: dict,
 
     # ========== 买入条件检查 ==========
 
-    # 多时间框架共振检查
+    # 多时间框架共振检查（周线+月线三重确认）
     weekly_confirm = df.attrs.get('weekly_confirmation', {})
-    weekly_resonance = False
+    monthly_confirm = df.attrs.get('monthly_confirmation', {})
+    multi_timeframe_resonance = False
 
-    if weekly_confirm:
-        daily_bos = last.get('bos_signal', 0)
-        daily_choch = last.get('choch_signal', 0)
+    if weekly_confirm and monthly_confirm:
+        current_bos = last.get('bos_signal', 0)
+        current_choch = last.get('choch_signal', 0)
         weekly_bos = weekly_confirm.get('weekly_bos_signal', 0)
         weekly_choch = weekly_confirm.get('weekly_choch_signal', 0)
+        weekly_trend = weekly_confirm.get('weekly_trend', 'sideways')
+        monthly_trend = monthly_confirm.get('monthly_trend', 'sideways')
 
-        # 共振条件：日线和周线同向
-        if (daily_bos == 1 and weekly_bos == 1) or \
-           (daily_choch == 1 and weekly_choch == 1):
-            weekly_resonance = True
+        # 三重共振条件：当前周期有信号 + 周线趋势同向 + 月线趋势同向
+        if current_bos == 1 or current_choch == 1:
+            if weekly_trend == 'uptrend' and monthly_trend == 'uptrend':
+                multi_timeframe_resonance = True
+        # 双重共振（降级）：当前周期 + 周线同向
+        elif (current_bos == 1 and weekly_bos == 1) or \
+             (current_choch == 1 and weekly_choch == 1):
+            if monthly_trend != 'downtrend':
+                multi_timeframe_resonance = True
 
-    # 条件 1: ChoCh 确认（下降趋势中出现 Higher High）+ 周线共振
+    # 条件 1: ChoCh 确认（下降趋势中出现 Higher High）+ 多时间框架共振
     choch_signal = last.get('choch_signal', 0)
     choch_strength = last.get('choch_strength', 0)
-    choch_confirmed = (choch_signal == 1 and choch_strength > 50 and weekly_resonance)
+    choch_confirmed = (choch_signal == 1 and choch_strength > 50 and multi_timeframe_resonance)
 
     choch_detail = ''
     if choch_confirmed:
-        choch_detail = f"看多 ChoCh 确认 (强度: {choch_strength:.1f}, 周线共振)"
-    elif choch_signal == 1 and choch_strength > 50 and not weekly_resonance:
-        choch_detail = f"ChoCh 信号强但周线未共振 (强度: {choch_strength:.1f})"
+        choch_detail = f"看多 ChoCh 确认 (强度: {choch_strength:.1f}, 多时间框架共振)"
+    elif choch_signal == 1 and choch_strength > 50 and not multi_timeframe_resonance:
+        choch_detail = f"ChoCh 信号强但多时间框架未共振 (强度: {choch_strength:.1f})"
     elif choch_signal == 1:
         choch_detail = f"ChoCh 信号弱 (强度: {choch_strength:.1f} < 50)"
     elif choch_signal == -1:
@@ -2465,15 +2553,19 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
     df = df.copy()
 
-    # 移动平均线
+    # 移动平均线（含长线均线）
     try:
         df['MA5'] = calc_sma(df['close'], 5)
         df['MA10'] = calc_sma(df['close'], 10)
         df['MA20'] = calc_sma(df['close'], 20)
+        df['MA50'] = calc_sma(df['close'], 50)    # 50周均线（长线关键均线）
+        df['MA200'] = calc_sma(df['close'], 200)   # 200周均线（长线关键均线）
     except Exception:
         df['MA5'] = np.nan
         df['MA10'] = np.nan
         df['MA20'] = np.nan
+        df['MA50'] = np.nan
+        df['MA200'] = np.nan
 
     # RSI
     try:
@@ -2499,13 +2591,7 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     # ========== 新增指标（纯pandas实现） ==========
 
-    # KDJ指标
-    try:
-        df = calc_kdj(df)
-    except Exception:
-        df['KDJ_K'] = np.nan
-        df['KDJ_D'] = np.nan
-        df['KDJ_J'] = np.nan
+    # KDJ指标已移除（长线投资不需要）
 
     # ADX指标（平均趋向指数）
     try:
@@ -2602,36 +2688,7 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def calc_kdj(df: pd.DataFrame, n: int = 9, m1: int = 3, m2: int = 3) -> pd.DataFrame:
-    """KDJ指标计算 - 添加除零保护
-
-    Args:
-        df: 包含high, low, close的DataFrame
-        n: RSV计算周期，默认9
-        m1: K值平滑周期，默认3
-        m2: D值平滑周期，默认3
-
-    Returns:
-        添加了KDJ指标的DataFrame
-    """
-    low_n = df['low'].rolling(window=n).min()
-    high_n = df['high'].rolling(window=n).max()
-
-    # 除零保护：当high_n == low_n时，RSV取平衡点50
-    denom = high_n - low_n
-    rsv = np.where(denom != 0,
-                   (df['close'] - low_n) / denom * 100,
-                   50.0)  # 平衡点
-    rsv = pd.Series(rsv, index=df.index).fillna(50)
-
-    # K值 = RSV的M1日指数移动平均
-    df['KDJ_K'] = rsv.ewm(alpha=1/m1, adjust=False).mean()
-    # D值 = K值的M2日指数移动平均
-    df['KDJ_D'] = df['KDJ_K'].ewm(alpha=1/m2, adjust=False).mean()
-    # J值 = 3*K - 2*D
-    df['KDJ_J'] = 3 * df['KDJ_K'] - 2 * df['KDJ_D']
-
-    return df
+# KDJ 指标已移除（长线投资不需要短期噪音指标）
 
 
 def calc_adx(df: pd.DataFrame, n: int = 14) -> pd.DataFrame:
@@ -4342,20 +4399,7 @@ def detect_signals(df: pd.DataFrame) -> dict:
 
     # ========== 新增指标信号 ==========
 
-    # KDJ信号
-    if pd.notna(last['KDJ_K']) and pd.notna(last['KDJ_D']) and pd.notna(prev['KDJ_K']) and pd.notna(prev['KDJ_D']):
-        # KDJ金叉/死叉
-        if prev['KDJ_K'] <= prev['KDJ_D'] and last['KDJ_K'] > last['KDJ_D']:
-            signals['golden_cross'].append('KDJ金叉')
-            signals['buy'].append('KDJ金叉')
-        if prev['KDJ_K'] >= prev['KDJ_D'] and last['KDJ_K'] < last['KDJ_D']:
-            signals['death_cross'].append('KDJ死叉')
-            signals['sell'].append('KDJ死叉')
-        # 超买超卖
-        if last['KDJ_J'] < 20:
-            signals['buy'].append('KDJ超卖')
-        elif last['KDJ_J'] > 80:
-            signals['sell'].append('KDJ超买')
+    # KDJ 已移除（长线投资不需要）
 
     # ADX趋势强度信号
     if pd.notna(last['ADX']) and pd.notna(last['ADX_PDI']) and pd.notna(last['ADX_NDI']):
@@ -4467,20 +4511,7 @@ def analyze_indicator_signals(df: pd.DataFrame) -> Dict[str, dict]:
             macd_status = f'震荡运行(hist={macd_hist:.2f})'
         indicators['MACD'] = {'signal': macd_signal, 'status': macd_status, 'weight': 1, 'is_auxiliary': True}
 
-    # KDJ (辅助指标，仅用于背离检测，决策权重降低)
-    if pd.notna(last['KDJ_K']) and pd.notna(last['KDJ_D']):
-        # 仅在极端超买超卖时输出信号
-        kdj_j = last['KDJ_J']
-        if kdj_j < 10:  # 极端超卖
-            kdj_signal = 'buy'
-            kdj_status = f'极端超卖(J={kdj_j:.1f})'
-        elif kdj_j > 90:  # 极端超买
-            kdj_signal = 'sell'
-            kdj_status = f'极端超买(J={kdj_j:.1f})'
-        else:
-            kdj_signal = 'neutral'
-            kdj_status = f'中性(J={kdj_j:.1f})'
-        indicators['KDJ'] = {'signal': kdj_signal, 'status': kdj_status, 'weight': 0.5, 'is_auxiliary': True}
+    # KDJ 已移除（长线投资不需要短期噪音指标）
 
     # ADX
     if pd.notna(last['ADX']) and pd.notna(last['ADX_PDI']) and pd.notna(last['ADX_NDI']):
@@ -4960,6 +4991,10 @@ def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False,
     weekly_confirmation = fetch_weekly_confirmation(code, demo=demo)
     df.attrs['weekly_confirmation'] = weekly_confirmation
 
+    # 获取月线确认
+    monthly_confirmation = fetch_monthly_confirmation(code, demo=demo)
+    df.attrs['monthly_confirmation'] = monthly_confirmation
+
     # 左侧交易信号分析
     contrarian = calc_contrarian_signals(df)
 
@@ -5054,7 +5089,13 @@ def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False,
     print(f"\n【技术指标】")
     table_rows = []
 
-    # 基础指标
+    # 基础指标（长线均线）
+    if pd.notna(last['MA50']):
+        table_rows.append(("MA50", f"{last['MA50']:.2f}", "长线支撑"))
+    if pd.notna(last['MA200']):
+        table_rows.append(("MA200", f"{last['MA200']:.2f}", "牛熊分界"))
+
+    # 短期均线（仅供参考）
     if pd.notna(last['MA5']):
         ma_signal = "多头排列" if last['MA5'] > last['MA10'] > last['MA20'] else ("空头排列" if last['MA5'] < last['MA10'] < last['MA20'] else "-")
         table_rows.append(("MA5", f"{last['MA5']:.2f}", ma_signal))
@@ -5079,9 +5120,7 @@ def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False,
         table_rows.append(("BOLL", f"{last['BB_middle']:.2f}", bb_signal))
 
     # KDJ
-    if pd.notna(last['KDJ_K']):
-        kdj_signal = "超买" if last['KDJ_J'] > 80 else ("超卖" if last['KDJ_J'] < 20 else "中性")
-        table_rows.append(("KDJ", f"K={last['KDJ_K']:.1f}", kdj_signal))
+    # KDJ 已移除（长线投资不需要）
 
     # ADX
     if pd.notna(last['ADX']):
@@ -5550,63 +5589,87 @@ def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False,
 
     # ========== 5.10 多时间框架共振 ==========
     print(f"\n{'='*70}")
-    print(f"  ║           多时间框架共振 (日线 × 周线)                       ║")
+    print(f"  ║           多时间框架共振 (周线 × 月线 三重确认)               ║")
     print(f"{'='*70}")
 
     weekly = df.attrs.get('weekly_confirmation', {})
-    if weekly and weekly['weekly_trend'] != 'sideways':
-        trend_icon_map = {
-            'uptrend': '▲',
-            'downtrend': '▼',
-            'sideways': '○'
-        }
-        trend_icon = trend_icon_map.get(weekly['weekly_trend'], '○')
+    monthly = df.attrs.get('monthly_confirmation', {})
 
-        trend_text_map = {
-            'uptrend': '上升趋势',
-            'downtrend': '下降趋势',
-            'sideways': '震荡'
-        }
-        trend_text = trend_text_map.get(weekly['weekly_trend'], '震荡')
+    trend_icon_map = {
+        'uptrend': '▲',
+        'downtrend': '▼',
+        'sideways': '○'
+    }
+    trend_text_map = {
+        'uptrend': '上升趋势',
+        'downtrend': '下降趋势',
+        'sideways': '震荡'
+    }
 
+    # 当前周期信号
+    current_bos = last.get('bos_signal', 0)
+    current_choch = last.get('choch_signal', 0)
+
+    # 周线趋势
+    if weekly and weekly.get('weekly_trend'):
+        w_trend = weekly['weekly_trend']
+        w_icon = trend_icon_map.get(w_trend, '○')
+        w_text = trend_text_map.get(w_trend, '震荡')
         print(f"\n  【周线趋势】")
-        print(f"    趋势方向: {trend_icon} {trend_text}")
+        print(f"    趋势方向: {w_icon} {w_text}")
         print(f"    周线 ADX: {weekly['weekly_adx']:.1f}")
-        print(f"    周线 BoS: {weekly['weekly_bos_signal']}")
-        print(f"    周线 ChoCh: {weekly['weekly_choch_signal']}")
-
-        # 判断共振
-        daily_bos = last.get('bos_signal', 0)
-        daily_choch = last.get('choch_signal', 0)
-        weekly_bos = weekly['weekly_bos_signal']
-        weekly_choch = weekly['weekly_choch_signal']
-
-        print(f"\n  【共振分析】")
-        print(f"    日线 BoS: {daily_bos}, 周线 BoS: {weekly_bos}")
-        print(f"    日线 ChoCh: {daily_choch}, 周线 ChoCh: {weekly_choch}")
-
-        # 共振条件：日线和周线同向
-        resonance_detected = False
-        if (daily_bos == 1 and weekly_bos == 1):
-            print(f"\n  ✓ BoS 多头共振确认 (日线+周线同步看多)")
-            resonance_detected = True
-        elif (daily_bos == -1 and weekly_bos == -1):
-            print(f"\n  ✓ BoS 空头共振确认 (日线+周线同步看空)")
-            resonance_detected = True
-
-        if (daily_choch == 1 and weekly_choch == 1):
-            print(f"\n  ✓ ChoCh 多头共振确认 (日线+周线同步看多)")
-            resonance_detected = True
-        elif (daily_choch == -1 and weekly_choch == -1):
-            print(f"\n  ✓ ChoCh 空头共振确认 (日线+周线同步看空)")
-            resonance_detected = True
-
-        if not resonance_detected:
-            print(f"\n  ✗ 日线与周线未共振，建议等待周线确认")
-
-        print(f"\n  说明: {weekly['explanation']}")
+        print(f"    周线 BoS: {weekly['weekly_bos_signal']}, ChoCh: {weekly['weekly_choch_signal']}")
     else:
-        print(f"\n  周线数据不足或处于震荡状态")
+        w_trend = 'sideways'
+        print(f"\n  【周线趋势】 数据不足")
+
+    # 月线趋势
+    if monthly and monthly.get('monthly_trend'):
+        m_trend = monthly['monthly_trend']
+        m_icon = trend_icon_map.get(m_trend, '○')
+        m_text = trend_text_map.get(m_trend, '震荡')
+        print(f"\n  【月线趋势】")
+        print(f"    趋势方向: {m_icon} {m_text}")
+        print(f"    月线 ADX: {monthly['monthly_adx']:.1f}")
+        print(f"    说明: {monthly['explanation']}")
+    else:
+        m_trend = 'sideways'
+        print(f"\n  【月线趋势】 数据不足")
+
+    # 三重共振判断
+    print(f"\n  【三重共振分析】")
+
+    # 判断各周期趋势方向
+    current_trend = 'sideways'
+    ma5 = last.get('MA5', 0)
+    ma20 = last.get('MA20', 0)
+    if pd.notna(ma5) and pd.notna(ma20):
+        if ma5 > ma20:
+            current_trend = 'uptrend'
+        elif ma5 < ma20:
+            current_trend = 'downtrend'
+
+    c_icon = trend_icon_map.get(current_trend, '○')
+    c_text = trend_text_map.get(current_trend, '震荡')
+    w_icon2 = trend_icon_map.get(w_trend, '○')
+    m_icon2 = trend_icon_map.get(m_trend, '○')
+
+    print(f"    当前周期: {c_icon} {c_text}")
+    print(f"    周线:     {w_icon2} {trend_text_map.get(w_trend, '震荡')}")
+    print(f"    月线:     {m_icon2} {trend_text_map.get(m_trend, '震荡')}")
+
+    # 三重共振条件
+    all_uptrend = (current_trend == 'uptrend' and w_trend == 'uptrend' and m_trend == 'uptrend')
+    all_downtrend = (current_trend == 'downtrend' and w_trend == 'downtrend' and m_trend == 'downtrend')
+
+    if all_uptrend:
+        print(f"\n  ✓✓✓ 三重多头共振确认 — 强烈看多信号")
+    elif all_downtrend:
+        print(f"\n  ✗✗✗ 三重空头共振确认 — 强烈看空信号")
+    elif current_trend == w_trend and current_trend != 'sideways':
+        print(f"\n  ✓✓ 双重共振（当前+周线同向），月线未确认")
+    else:
+        print(f"\n  ✗ 多时间框架未共振，建议等待趋势同向确认")
 
     # ========== 5.11 压力测试 (如果启用) ==========
     if stress_test:
@@ -5806,7 +5869,7 @@ def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False,
 
 # ============ 批量分析与压力测试模块 ============
 
-def analyze_portfolio(codes: list, period: str = 'd', days: int = 60, demo: bool = False, stress_test: bool = False) -> dict:
+def analyze_portfolio(codes: list, period: str = 'w', days: int = 1000, demo: bool = False, stress_test: bool = False) -> dict:
     """
     批量分析多只股票
 
@@ -5871,6 +5934,10 @@ def analyze_portfolio(codes: list, period: str = 'd', days: int = 60, demo: bool
             # 获取周线确认
             weekly_confirmation = fetch_weekly_confirmation(code, demo=demo)
             df_clean.attrs['weekly_confirmation'] = weekly_confirmation
+
+            # 获取月线确认
+            monthly_confirmation = fetch_monthly_confirmation(code, demo=demo)
+            df_clean.attrs['monthly_confirmation'] = monthly_confirmation
 
             # 价格目标
             price_targets = calculate_price_targets(
@@ -6191,7 +6258,7 @@ def generate_hedge_strategy(code: str, scenario_price: float, support_levels: li
     return result
 
 
-def print_portfolio_analysis(results: dict):
+def print_portfolio_analysis(results: dict, period: str = 'w'):
     """
     打印批量分析结果 (完整输出模式)
 
@@ -6225,7 +6292,7 @@ def print_portfolio_analysis(results: dict):
         # 复用 print_analysis 的核心逻辑
         df = analysis['df']
         print_analysis(
-            df, code, 'd',
+            df, code, period,
             demo=False,
             stress_test=(analysis.get('stress_result') is not None)
         )
@@ -6323,10 +6390,10 @@ def main():
     )
 
     parser.add_argument('code', nargs='?', help='股票代码（A股6位数字，美股代码如AAPL）')
-    parser.add_argument('-p', '--period', choices=['d', 'w'], default='d',
-                        help='K线周期：d=日线，w=周线 (默认: d)')
-    parser.add_argument('-d', '--days', type=int, default=60,
-                        help='分析天数 (默认: 60)')
+    parser.add_argument('-p', '--period', choices=['d', 'w', 'm'], default='w',
+                        help='K线周期：d=日线，w=周线，m=月线 (默认: w)')
+    parser.add_argument('-d', '--days', type=int, default=1000,
+                        help='分析天数 (默认: 1000，约3-5年)')
     parser.add_argument('--demo', action='store_true',
                         help='使用演示数据模式（无需网络）')
     parser.add_argument('--portfolio', nargs='+',
@@ -6341,7 +6408,7 @@ def main():
         if args.portfolio:
             codes = [c.upper() for c in args.portfolio]
             results = analyze_portfolio(codes, args.period, args.days, args.demo, args.stress_test)
-            print_portfolio_analysis(results)
+            print_portfolio_analysis(results, period=args.period)
             return
 
         # 单股票分析模式
