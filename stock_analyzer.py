@@ -279,6 +279,12 @@ def safe_fetch_yfinance_chart(code: str, period: str, days: int) -> Tuple[Option
     except ImportError:
         return None, "请安装requests库"
 
+    def _do_request(verify=True):
+        response = requests.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT, verify=verify)
+        if response.status_code != 200:
+            return None, f"API请求失败: HTTP {response.status_code}"
+        return parse_chart_response(response.json(), code, period, days)
+
     try:
         yf_code = normalize_symbol(code)
         end_time = int(time.time())
@@ -286,12 +292,7 @@ def safe_fetch_yfinance_chart(code: str, period: str, days: int) -> Tuple[Option
 
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_code}"
 
-        # 根据周期动态设置 interval
-        interval_map = {
-            'd': '1d',
-            'w': '1wk',
-            'm': '1mo'
-        }
+        interval_map = {'d': '1d', 'w': '1wk', 'm': '1mo'}
         interval = interval_map.get(period, '1d')
 
         params = {
@@ -302,13 +303,15 @@ def safe_fetch_yfinance_chart(code: str, period: str, days: int) -> Tuple[Option
         }
         headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'}
 
-        response = requests.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
+        return _do_request()
 
-        if response.status_code != 200:
-            return None, f"API请求失败: HTTP {response.status_code}"
-
-        data = response.json()
-        return parse_chart_response(data, code, period, days)
+    except requests.exceptions.SSLError:
+        try:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            return _do_request(verify=False)
+        except Exception:
+            return None, f"获取数据失败: {code} - SSLError"
 
     except Exception as e:
         return None, f"获取数据失败: {code} - {type(e).__name__}"
@@ -430,6 +433,10 @@ def fetch_stock_data(code: str, period: str, days: int, retry: int = 2, demo: bo
         if error and ("rate" in error.lower() or "429" in error or "http 429" in error.lower()):
             wait_time = (attempt + 1) * 3
             print(f"API限速，等待{wait_time}秒后重试... ({attempt + 1}/{retry})")
+            time.sleep(wait_time)
+        elif error and ("connection" in error.lower() or "timeout" in error.lower()):
+            wait_time = (attempt + 1) * 2
+            print(f"网络异常({error})，等待{wait_time}秒后重试... ({attempt + 1}/{retry})")
             time.sleep(wait_time)
         else:
             raise ValueError(error if error else "获取数据失败，请检查股票代码或网络连接")
@@ -2919,6 +2926,329 @@ def generate_decision_dashboard(df: pd.DataFrame, price_targets: dict,
         'action': mapped['action'],
         'verdict': mapped['verdict'],
         'core_conclusion': core_conclusion
+    }
+
+
+def generate_position_strategy(df: pd.DataFrame, current_price: float, entry_price: float,
+                                dashboard: dict, chandelier: dict, contrarian: dict,
+                                distribution: dict, price_targets: dict,
+                                dd_analysis: dict = None) -> dict:
+    """持仓应对策略 — 根据浮盈/浮亏自动生成操作建议。
+
+    返回 dict，包含 'mode'('loss'/'profit'), 以及各子模块结果。
+    """
+    if entry_price is None or entry_price <= 0 or current_price is None or current_price <= 0:
+        return {'available': False}
+
+    pnl_pct = (current_price - entry_price) / entry_price * 100
+    decision = dashboard.get('decision', 'HOLD_EMPTY')
+    circuit_triggered = dashboard.get('circuit_breaker_triggered', False)
+
+    # ── 趋势状态判断 ──
+    last = df.iloc[-1]
+    ma50 = last.get('MA50') if 'MA50' in df.columns else None
+    ma200 = last.get('MA200') if 'MA200' in df.columns else None
+    choch_signal = last.get('choch_signal', 0)
+
+    long_stop = chandelier.get('long_stop')
+    stop_breached = (long_stop is not None and current_price < long_stop)
+
+    # 死叉判断
+    death_cross = False
+    if ma50 is not None and ma200 is not None and not pd.isna(ma50) and not pd.isna(ma200):
+        death_cross = ma50 < ma200
+
+    # 趋势状态: 'intact' / 'damaged' / 'broken'
+    broken_count = sum([
+        stop_breached,
+        choch_signal == -1,
+        death_cross,
+        decision in ('SELL', 'LONG_TERM_BEAR', 'VALUE_TRAP'),
+    ])
+    if broken_count >= 3 or circuit_triggered:
+        trend_status = 'broken'
+        trend_text = '趋势破坏'
+    elif broken_count >= 1:
+        trend_status = 'damaged'
+        trend_text = '趋势受损'
+    else:
+        trend_status = 'intact'
+        trend_text = '趋势完好'
+
+    # ── 止损距离 ──
+    if long_stop is not None:
+        stop_dist_pct = (current_price - long_stop) / current_price * 100
+        if stop_breached:
+            stop_urgency = 'breached'
+        elif stop_dist_pct < 2:
+            stop_urgency = 'critical'
+        elif stop_dist_pct < 5:
+            stop_urgency = 'warning'
+        else:
+            stop_urgency = 'safe'
+    else:
+        stop_dist_pct = None
+        stop_urgency = 'unknown'
+
+    if pnl_pct < 0:
+        return _calc_loss_strategy(
+            pnl_pct, trend_status, trend_text, stop_urgency, stop_dist_pct,
+            long_stop, current_price, entry_price, decision, circuit_triggered,
+            contrarian, distribution, price_targets, df, dd_analysis
+        )
+    else:
+        return _calc_profit_strategy(
+            pnl_pct, trend_status, trend_text, stop_urgency, stop_dist_pct,
+            long_stop, current_price, entry_price, decision, circuit_triggered,
+            contrarian, distribution, price_targets, df
+        )
+
+
+def _calc_loss_strategy(pnl_pct, trend_status, trend_text, stop_urgency, stop_dist_pct,
+                        long_stop, current_price, entry_price, decision, circuit_triggered,
+                        contrarian, distribution, price_targets, df, dd_analysis):
+    """亏损应对策略计算"""
+    abs_loss = abs(pnl_pct)
+
+    # 亏损分级（参照历史最大回撤动态修正）
+    max_dd = 0
+    if dd_analysis and dd_analysis.get('available'):
+        max_dd = abs(dd_analysis.get('max_drawdown', 0))
+
+    # 动态阈值：历史最大回撤的 30%/60%/90%
+    if max_dd > 0:
+        t_shallow = max(5, max_dd * 0.3)
+        t_moderate = max(15, max_dd * 0.6)
+        t_deep = max(30, max_dd * 0.9)
+    else:
+        t_shallow, t_moderate, t_deep = 5, 15, 30
+
+    if abs_loss < t_shallow:
+        loss_level = 'shallow'
+        loss_text = f'浅度亏损 (<{t_shallow:.0f}%)'
+    elif abs_loss < t_moderate:
+        loss_level = 'moderate'
+        loss_text = f'中度亏损 ({t_shallow:.0f}%-{t_moderate:.0f}%)'
+    elif abs_loss < t_deep:
+        loss_level = 'deep'
+        loss_text = f'深度亏损 ({t_moderate:.0f}%-{t_deep:.0f}%)'
+    else:
+        loss_level = 'extreme'
+        loss_text = f'极度亏损 (>{t_deep:.0f}%)'
+
+    # 减仓建议
+    if circuit_triggered:
+        reduce_pct = 100
+        reduce_reason = '熔断触发，立即清仓'
+    elif decision in ('SELL', 'LONG_TERM_BEAR', 'VALUE_TRAP'):
+        reduce_pct = 100
+        reduce_reason = 'SMC决策为卖出，建议清仓'
+    elif trend_status == 'broken' and loss_level in ('deep', 'extreme'):
+        reduce_pct = 50
+        reduce_reason = '趋势破坏+深度亏损，建议减仓50%'
+    elif trend_status == 'damaged' and loss_level == 'moderate':
+        reduce_pct = 30
+        reduce_reason = '趋势受损+中度亏损，建议减仓30%'
+    else:
+        reduce_pct = 0
+        reduce_reason = ''
+
+    # 加仓评估
+    contrarian_score = contrarian.get('composite_score', 0) if contrarian else 0
+    zscore_val = None
+    try:
+        zscore_data = contrarian.get('zscore', {}) if contrarian else {}
+        zscore_val = zscore_data.get('zscore')
+    except Exception:
+        pass
+
+    add_conditions = []
+    add_ok = True
+
+    if loss_level == 'extreme':
+        add_ok = False
+        add_conditions.append('✗ 极度亏损禁止加仓')
+    else:
+        if trend_status == 'broken':
+            add_ok = False
+            add_conditions.append('✗ 趋势已破坏')
+        else:
+            add_conditions.append('✓ 趋势未破坏')
+
+        if contrarian_score >= 65:
+            add_conditions.append(f'✓ 左侧评分 {contrarian_score} ≥ 65')
+        else:
+            add_ok = False
+            add_conditions.append(f'✗ 左侧评分 {contrarian_score} < 65')
+
+        if zscore_val is not None:
+            if zscore_val < -1.5:
+                add_conditions.append(f'✓ Z-Score {zscore_val:.2f} < -1.5')
+            else:
+                add_ok = False
+                add_conditions.append(f'✗ Z-Score {zscore_val:.2f} ≥ -1.5（未超卖）')
+        else:
+            add_conditions.append('— Z-Score 数据不足，跳过')
+
+    # 加仓价位和股数
+    add_price = None
+    add_shares = None
+    if add_ok and long_stop:
+        add_price = price_targets.get('buy_price', current_price)
+        try:
+            sizing = calc_position_sizing(current_price, long_stop)
+            add_shares = sizing.get('suggested_shares', 0)
+        except Exception:
+            pass
+
+    # 心理建设
+    bias_map = {
+        'shallow': ('锚定效应', '你可能在用买入价锚定判断，而非客观评估当前价值。', '若趋势完好，浅度回调是正常波动。'),
+        'moderate': ('处置效应', '亏损时倾向于持有等待回本，而非理性评估。', '问自己：若今天才看到这只股票，你还会买入吗？'),
+        'deep': ('沉没成本谬误', '已亏损的钱不应影响未来决策。', '深度亏损时，每一分钱都是新的投资决策。'),
+        'extreme': ('鸵鸟心态', '极度亏损时容易回避现实，拒绝止损。', '最坏情景：若趋势持续恶化，亏损可能进一步扩大。'),
+    }
+    bias_name, bias_desc, rational_action = bias_map.get(loss_level, bias_map['moderate'])
+
+    return {
+        'available': True,
+        'mode': 'loss',
+        'pnl_pct': round(pnl_pct, 2),
+        'loss_level': loss_level,
+        'loss_text': loss_text,
+        'trend_status': trend_status,
+        'trend_text': trend_text,
+        'long_stop': long_stop,
+        'stop_dist_pct': round(stop_dist_pct, 2) if stop_dist_pct is not None else None,
+        'stop_urgency': stop_urgency,
+        'add_ok': add_ok,
+        'add_conditions': add_conditions,
+        'add_price': add_price,
+        'add_shares': add_shares,
+        'reduce_pct': reduce_pct,
+        'reduce_reason': reduce_reason,
+        'bias_name': bias_name,
+        'bias_desc': bias_desc,
+        'rational_action': rational_action,
+    }
+
+
+def _calc_profit_strategy(pnl_pct, trend_status, trend_text, stop_urgency, stop_dist_pct,
+                          long_stop, current_price, entry_price, decision, circuit_triggered,
+                          contrarian, distribution, price_targets, df):
+    """盈利应对策略计算"""
+    # 盈利分级
+    if pnl_pct < 10:
+        profit_level = 'small'
+        profit_text = '小幅盈利 (<10%)'
+    elif pnl_pct < 25:
+        profit_level = 'moderate'
+        profit_text = '中等盈利 (10%-25%)'
+    elif pnl_pct < 50:
+        profit_level = 'large'
+        profit_text = '大幅盈利 (25%-50%)'
+    else:
+        profit_level = 'excessive'
+        profit_text = '超额盈利 (>50%)'
+
+    # 分批止盈目标
+    target_price = price_targets.get('target_price')
+    take_profit_levels = []
+    if target_price and target_price > entry_price:
+        progress = (current_price - entry_price) / (target_price - entry_price) * 100
+        tp1 = entry_price + (target_price - entry_price) * 0.5
+        tp2 = entry_price + (target_price - entry_price) * 0.8
+        take_profit_levels = [
+            {'price': round(tp1, 2), 'progress': 50, 'action': '减仓1/3', 'reached': current_price >= tp1},
+            {'price': round(tp2, 2), 'progress': 80, 'action': '再减1/3', 'reached': current_price >= tp2},
+            {'price': round(target_price, 2), 'progress': 100, 'action': '清仓', 'reached': current_price >= target_price},
+        ]
+    else:
+        progress = None
+
+    # VWAP偏离检查
+    last = df.iloc[-1]
+    vwap = last.get('VWAP') if 'VWAP' in df.columns else None
+    vwap_deviation = None
+    vwap_alert = False
+    if vwap and not pd.isna(vwap) and vwap > 0:
+        vwap_deviation = (current_price - vwap) / vwap * 100
+        # 估算sigma（用ATR/VWAP近似）
+        atr = last.get('ATR')
+        if atr and not pd.isna(atr):
+            vwap_sigma = atr / vwap * 100
+            vwap_sigmas = vwap_deviation / vwap_sigma if vwap_sigma > 0 else 0
+            vwap_alert = vwap_sigmas > 3
+        else:
+            vwap_sigmas = None
+    else:
+        vwap_sigmas = None
+
+    # 移动止损锁定利润
+    locked_profit_pct = None
+    if long_stop and long_stop > entry_price:
+        locked_profit_pct = round((long_stop - entry_price) / entry_price * 100, 2)
+
+    # 派发预警
+    dist_score = distribution.get('distribution_score', 0) if distribution else 0
+    if dist_score >= 70:
+        dist_alert = 'critical'
+        dist_text = '强烈派发信号'
+    elif dist_score >= 40:
+        dist_alert = 'warning'
+        dist_text = '出现派发迹象'
+    elif dist_score >= 20:
+        dist_alert = 'watch'
+        dist_text = '轻微派发迹象'
+    else:
+        dist_alert = 'none'
+        dist_text = '无派发信号'
+
+    # 加仓禁区检查
+    rsi = last.get('RSI') if 'RSI' in df.columns else None
+    zscore_val = None
+    try:
+        zscore_data = contrarian.get('zscore', {}) if contrarian else {}
+        zscore_val = zscore_data.get('zscore')
+    except Exception:
+        pass
+
+    add_ban_reasons = []
+    if pnl_pct > 20:
+        add_ban_reasons.append(f'浮盈 {pnl_pct:.1f}% > 20%')
+    if vwap_sigmas is not None and vwap_sigmas > 2:
+        add_ban_reasons.append(f'VWAP偏离 {vwap_sigmas:.1f}σ > 2σ')
+    if dist_score > 40:
+        add_ban_reasons.append(f'派发评分 {dist_score} > 40')
+    if zscore_val is not None and zscore_val > 2:
+        add_ban_reasons.append(f'Z-Score {zscore_val:.2f} > 2（超买）')
+    if rsi is not None and not pd.isna(rsi) and rsi > 70:
+        add_ban_reasons.append(f'RSI {rsi:.1f} > 70（超买）')
+
+    add_banned = len(add_ban_reasons) >= 2
+
+    return {
+        'available': True,
+        'mode': 'profit',
+        'pnl_pct': round(pnl_pct, 2),
+        'profit_level': profit_level,
+        'profit_text': profit_text,
+        'trend_status': trend_status,
+        'trend_text': trend_text,
+        'long_stop': long_stop,
+        'stop_dist_pct': round(stop_dist_pct, 2) if stop_dist_pct is not None else None,
+        'stop_urgency': stop_urgency,
+        'locked_profit_pct': locked_profit_pct,
+        'take_profit_levels': take_profit_levels,
+        'progress': round(progress, 1) if progress is not None else None,
+        'vwap_deviation': round(vwap_deviation, 2) if vwap_deviation is not None else None,
+        'vwap_sigmas': round(vwap_sigmas, 2) if vwap_sigmas is not None else None,
+        'vwap_alert': vwap_alert,
+        'dist_score': dist_score,
+        'dist_alert': dist_alert,
+        'dist_text': dist_text,
+        'add_banned': add_banned,
+        'add_ban_reasons': add_ban_reasons,
     }
 
 
@@ -5548,10 +5878,137 @@ def build_optional_context(code: str, df: pd.DataFrame, demo: bool = False) -> d
     return context
 
 
-def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False, stress_test: bool = False):
+def _print_loss_response(strategy: dict, entry_price: float, current_price: float):
+    """打印亏损应对策略"""
+    print(f"\n{'='*70}")
+    print(f"  ║           持仓应对策略 — 亏损管理                              ║")
+    print(f"{'='*70}")
+
+    print(f"\n  【浮亏概览】")
+    print(f"    买入均价: {entry_price:.2f}")
+    print(f"    当前价格: {current_price:.2f}")
+    print(f"    浮亏幅度: {strategy['pnl_pct']:.2f}%")
+    print(f"    亏损等级: {strategy['loss_text']}")
+    print(f"    趋势状态: {strategy['trend_text']}")
+
+    print(f"\n  【止损距离监控】")
+    if strategy['long_stop']:
+        print(f"    Chandelier止损价: {strategy['long_stop']:.2f}")
+        if strategy['stop_dist_pct'] is not None:
+            print(f"    距离止损: {strategy['stop_dist_pct']:.2f}%")
+        urgency_map = {
+            'safe': '✓ 安全（距离>5%）',
+            'warning': '⚠ 警告（距离2%-5%）',
+            'critical': '⚠⚠ 危险（距离<2%）',
+            'breached': '✗✗ 已击穿',
+            'unknown': '— 数据不足'
+        }
+        print(f"    紧急度: {urgency_map.get(strategy['stop_urgency'], '未知')}")
+    else:
+        print(f"    止损价: 数据不足")
+
+    print(f"\n  【加仓评估】")
+    if strategy['add_ok']:
+        print(f"    ✓ 满足加仓条件")
+        for cond in strategy['add_conditions']:
+            print(f"      {cond}")
+        if strategy['add_price'] and strategy['add_shares']:
+            print(f"    建议价位: {strategy['add_price']:.2f}")
+            print(f"    建议股数: {strategy['add_shares']} 股")
+    else:
+        print(f"    ✗ 不满足加仓条件")
+        for cond in strategy['add_conditions']:
+            print(f"      {cond}")
+
+    if strategy['reduce_pct'] > 0:
+        print(f"\n  【减仓建议】")
+        print(f"    建议减仓: {strategy['reduce_pct']}%")
+        print(f"    理由: {strategy['reduce_reason']}")
+
+    print(f"\n  【心理建设】")
+    print(f"    认知偏差: {strategy['bias_name']}")
+    print(f"    偏差描述: {strategy['bias_desc']}")
+    print(f"    理性操作: {strategy['rational_action']}")
+
+    print(f"\n  ── 策略总结 ──")
+    if strategy['reduce_pct'] > 0:
+        print(f"  当前建议: 减仓 {strategy['reduce_pct']}%")
+    elif strategy['add_ok']:
+        print(f"  当前建议: 可考虑加仓，但需等待右侧确认")
+    else:
+        print(f"  当前建议: 持仓观望，严守止损")
+
+
+def _print_profit_response(strategy: dict, entry_price: float, current_price: float):
+    """打印盈利应对策略"""
+    print(f"\n{'='*70}")
+    print(f"  ║           持仓应对策略 — 盈利管理                              ║")
+    print(f"{'='*70}")
+
+    print(f"\n  【浮盈概览】")
+    print(f"    买入均价: {entry_price:.2f}")
+    print(f"    当前价格: {current_price:.2f}")
+    print(f"    浮盈幅度: {strategy['pnl_pct']:.2f}%")
+    print(f"    盈利等级: {strategy['profit_text']}")
+    print(f"    趋势状态: {strategy['trend_text']}")
+
+    print(f"\n  【分批止盈】")
+    if strategy['take_profit_levels']:
+        if strategy['progress'] is not None:
+            print(f"    目标价进度: {strategy['progress']:.1f}%")
+        for tp in strategy['take_profit_levels']:
+            status = '✓' if tp['reached'] else '—'
+            print(f"    [{status}] {tp['progress']}%进度 @ {tp['price']:.2f} → {tp['action']}")
+    else:
+        print(f"    目标价数据不足，建议手动设定止盈位")
+
+    if strategy['vwap_alert']:
+        print(f"\n    ⚠ VWAP偏离 {strategy['vwap_sigmas']:.1f}σ > 3σ，建议即时减仓")
+
+    print(f"\n  【移动止损】")
+    if strategy['long_stop']:
+        print(f"    Chandelier止损价: {strategy['long_stop']:.2f}")
+        if strategy['locked_profit_pct'] is not None and strategy['locked_profit_pct'] > 0:
+            print(f"    已锁定利润: {strategy['locked_profit_pct']:.2f}%")
+        else:
+            print(f"    已锁定利润: 0% (止损价低于成本)")
+    else:
+        print(f"    止损价: 数据不足")
+
+    print(f"\n  【派发预警】")
+    alert_icon = {'none': '✓', 'watch': '—', 'warning': '⚠', 'critical': '⚠⚠'}.get(strategy['dist_alert'], '—')
+    print(f"    [{alert_icon}] 派发评分: {strategy['dist_score']} 分")
+    print(f"    信号: {strategy['dist_text']}")
+    if strategy['dist_alert'] in ('warning', 'critical'):
+        print(f"    → 建议密切关注，考虑分批减仓")
+
+    print(f"\n  【加仓禁区】")
+    if strategy['add_banned']:
+        print(f"    ✗ 当前处于加仓禁区（触发 {len(strategy['add_ban_reasons'])} 项）")
+        for reason in strategy['add_ban_reasons']:
+            print(f"      • {reason}")
+    else:
+        print(f"    ✓ 未触发加仓禁区")
+
+    print(f"\n  ── 策略总结 ──")
+    if strategy['dist_alert'] == 'critical':
+        print(f"  当前建议: 强烈派发信号，建议减仓或清仓")
+    elif strategy['vwap_alert']:
+        print(f"  当前建议: VWAP严重偏离，建议即时减仓")
+    elif strategy['take_profit_levels']:
+        reached = [tp for tp in strategy['take_profit_levels'] if tp['reached']]
+        if reached:
+            print(f"  当前建议: 已达 {reached[-1]['progress']}% 目标，{reached[-1]['action']}")
+        else:
+            print(f"  当前建议: 持仓待涨，按计划分批止盈")
+    else:
+        print(f"  当前建议: 持仓待涨，严守移动止损")
+
+
+def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False, stress_test: bool = False, entry_price: float = None):
     """打印分析结果（表格格式）
 
-    输出顺序：大盘复盘 → 指标表格 → 筹码/资金流 → 新闻情绪 → 买卖点+清单 → 决策仪表盘 → 综合结论
+    输出顺序：大盘复盘 → 指标表格 → 筹码/资金流 → 新闻情绪 → 买卖点+清单 → 决策仪表盘 → 持仓应对策略 → 综合结论
     """
     # 计算指标
     df = calculate_indicators(df)
@@ -6757,6 +7214,64 @@ def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False,
 
     print(f"{'='*70}")
 
+    # ========== 7.5 持仓应对策略 ==========
+    # 判断是否有持仓（根据决策推断）
+    decision = dashboard.get('decision', 'HOLD_EMPTY')
+    has_position = decision in ('HOLD_WITH_POSITION', 'SELL', 'LONG_TERM_BEAR', 'VALUE_TRAP')
+
+    # 获取 entry_price（优先级：命令行参数 > Volume Profile POC > 60日均价）
+    pos_entry_price = None
+    entry_source = ''
+
+    if entry_price is not None:
+        pos_entry_price = entry_price
+        entry_source = '命令行参数'
+        has_position = True  # 指定了买入价则视为有持仓
+    elif has_position:
+        try:
+            # 尝试从 Volume Profile 获取 POC
+            vol_profile = context.get('volume_profile', {})
+            if vol_profile and vol_profile.get('poc'):
+                pos_entry_price = vol_profile['poc']
+                entry_source = 'Volume Profile POC'
+            else:
+                # 使用 60 日均价
+                if len(df) >= 60:
+                    pos_entry_price = df['close'].tail(60).mean()
+                    entry_source = '60日均价估算'
+                else:
+                    pos_entry_price = df['close'].mean()
+                    entry_source = f'{len(df)}日均价估算'
+        except Exception:
+            pass
+
+    if has_position and pos_entry_price and pos_entry_price > 0:
+        try:
+            current_price = last['close']
+
+            # 计算回撤分析
+            dd_analysis = calc_max_drawdown_analysis(df)
+
+            # 生成持仓策略
+            position_strategy = generate_position_strategy(
+                df, current_price, pos_entry_price, dashboard,
+                chandelier, contrarian, distribution, price_targets,
+                dd_analysis=dd_analysis
+            )
+
+            if position_strategy.get('available'):
+                if position_strategy['mode'] == 'loss':
+                    _print_loss_response(position_strategy, pos_entry_price, current_price)
+                else:
+                    _print_profit_response(position_strategy, pos_entry_price, current_price)
+
+                if entry_price is None:
+                    print(f"\n  说明: 买入均价来源于 {entry_source}")
+                    print(f"  提示: 使用 --entry-price 参数可指定实际买入均价")
+        except Exception:
+            # 持仓策略失败不影响主流程
+            pass
+
     # ========== 8. 综合结论（研报风格） ==========
     print(f"\n【综合结论】(研报风格)")
     try:
@@ -7329,6 +7844,8 @@ def main():
                         help='批量分析多只股票 (例: --portfolio 0700.HK 1810.HK QQQ TSLA NVDA)')
     parser.add_argument('--stress-test', action='store_true',
                         help='执行 15%% 回撤压力测试')
+    parser.add_argument('--entry-price', type=float, default=None,
+                        help='持仓买入均价（用于持仓应对策略，不指定则使用筹码成本中心估算）')
 
     args = parser.parse_args()
 
@@ -7373,7 +7890,7 @@ def main():
             print(f"提示: 数据量较少（{len(df_clean)}条），结论仅供参考，建议使用 -d 120 获取更多数据")
 
         # 分析并输出
-        print_analysis(df_clean, args.code, args.period, demo=args.demo, stress_test=args.stress_test)
+        print_analysis(df_clean, args.code, args.period, demo=args.demo, stress_test=args.stress_test, entry_price=args.entry_price)
 
     except KeyboardInterrupt:
         print("\n操作已取消")
