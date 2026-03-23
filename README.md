@@ -26,6 +26,9 @@ python3 stock_analyzer.py --portfolio 0700.HK 1810.HK QQQ TSLA NVDA -d 120
 # 压力测试（15% 回撤场景）
 python3 stock_analyzer.py NVDA -d 120 --stress-test
 
+# 持仓应对策略（指定买入均价）
+python3 stock_analyzer.py NVDA -d 120 --entry-price 170.5
+
 # 演示模式（离线，不拉取网络数据）
 python3 stock_analyzer.py TSLA --demo
 ```
@@ -40,13 +43,14 @@ python3 stock_analyzer.py TSLA --demo
 | `--demo` | 演示模式，使用模拟数据 | 关闭 |
 | `--portfolio` | 批量分析多只股票 | 无 |
 | `--stress-test` | 执行 15% 回撤压力测试 | 关闭 |
+| `--entry-price` | 持仓买入均价（用于持仓应对策略） | 自动估算 |
 
 ## 系统架构
 
 ### 文件结构
 
 ```
-stock_analyzer.py      # 主程序（~7400行）
+stock_analyzer.py      # 主程序（~7900行）
 ├── fundamentals.py    # 基本面扫雷：稀释检测、ROE/FCF质量、退市风险、价值陷阱否决
 ├── smart_money.py     # 聪明钱动向：内部人士交易、机构持股、综合确认
 ├── sector_analysis.py # 行业相对强弱：行业RS线、财报波动统计、宏观熊市检查
@@ -99,6 +103,7 @@ stock_analyzer.py      # 主程序（~7400行）
 | **左侧交易** | stock_analyzer.py | Z-Score、量能衰竭、波动率状态、三重背离、机构级支撑压力 |
 | **右侧交易** | stock_analyzer.py | BoS、ChoCh、多时间框架共振（日线×周线×月线） |
 | **风控** | stock_analyzer.py | Chandelier Exit 止损、黑天鹅熔断、VIX 监控、回撤分析 |
+| **持仓应对策略** | stock_analyzer.py | 亏损/盈利分级管理、分批止盈、VWAP偏离预警、加仓禁区检测 |
 
 ### 输出区块顺序
 
@@ -114,7 +119,7 @@ stock_analyzer.py      # 主程序（~7400行）
 → 行业相对强弱与宏观风控
 → 左侧交易信号 → 右侧确认信号 → VWAP偏离度 → 派发模式
 → 长线风控 → 相对强弱 → 定投建议 → 操作检查清单
-→ SMC决策仪表盘 → 综合结论
+→ SMC决策仪表盘 → 持仓应对策略 → 综合结论
 ```
 
 **长线熊市模式（50W < 200W 触发）：**
