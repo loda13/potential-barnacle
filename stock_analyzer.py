@@ -7990,11 +7990,15 @@ def portfolio_list() -> None:
 
 def calc_breakeven_analysis(entry_price: float, quantity: int,
                              current_price: float, strategy: dict,
-                             price_targets: dict) -> dict:
+                             price_targets: dict,
+                             circuit_triggered: bool = False,
+                             decision: str = '') -> dict:
     """回本路径分析 — 评估持仓/补仓/止损换股三条路径，推荐最高效方案。
 
     strategy: 来自 generate_position_strategy() 的返回值（loss mode）
     price_targets: 来自 calculate_price_targets() 的返回值
+    circuit_triggered: 是否触发熔断（来自 dashboard）
+    decision: SMC决策字符串（来自 dashboard，如 'SELL', 'HOLD_WITH_POSITION'）
     """
     if entry_price <= 0 or current_price <= 0 or quantity <= 0:
         return {'available': False}
@@ -8006,8 +8010,6 @@ def calc_breakeven_analysis(entry_price: float, quantity: int,
     # ── 路径1：持有等待 ──
     required_gain_pct = (entry_price / current_price - 1) * 100  # 例：亏20% → 需涨25%
     trend_status = strategy.get('trend_status', 'damaged')
-    circuit_triggered = strategy.get('circuit_triggered', False)
-    decision = strategy.get('decision_raw', '')  # 从strategy中提取原始decision
 
     if trend_status == 'intact' and required_gain_pct < 15:
         hold_feasibility = 'high'
