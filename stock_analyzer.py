@@ -8,6 +8,8 @@
 import argparse
 import contextlib
 import io
+import json
+import os
 import sys
 import time
 import re
@@ -53,6 +55,10 @@ CHANDELIER_ATR_MULTIPLIER = 2.5  # Chandelier Exit ATR倍数
 CHANDELIER_LOOKBACK = 22      # Chandelier Exit 回溯天数
 SLIPPAGE_PCT = 0.002          # 滑点 0.2%
 ADV_POSITION_LIMIT = 0.01    # 仓位不超过 ADV 的 1%
+
+# ============ 持仓管理参数 ============
+PORTFOLIO_FILE = 'portfolio.json'
+MAX_HOLDINGS = 5
 
 
 def normalize_symbol(code: str) -> str:
@@ -7808,6 +7814,54 @@ def append_decision_log(code: str, df: pd.DataFrame, price_targets: dict,
 
     except Exception:
         pass  # 日志写入失败不影响主流程
+
+
+# ============ 持仓管理 ============
+
+
+def _get_portfolio_path() -> str:
+    """返回 portfolio.json 的绝对路径（与脚本同目录）"""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), PORTFOLIO_FILE)
+
+
+def load_portfolio() -> dict:
+    """加载持仓文件。文件不存在则返回空结构。"""
+    path = _get_portfolio_path()
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if not isinstance(data.get('holdings'), dict):
+            data['holdings'] = {}
+        return data
+    except FileNotFoundError:
+        return {'version': 1, 'account_size': DEFAULT_ACCOUNT_SIZE, 'holdings': {}}
+    except Exception:
+        return {'version': 1, 'account_size': DEFAULT_ACCOUNT_SIZE, 'holdings': {}}
+
+
+def save_portfolio(portfolio: dict) -> None:
+    """原子写入持仓 JSON（先写临时文件再 rename，防止写入中断损坏文件）。"""
+    path = _get_portfolio_path()
+    tmp_path = path + '.tmp'
+    try:
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(portfolio, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+    except Exception as e:
+        print(f"  警告: 持仓文件保存失败: {e}")
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def calc_weighted_avg_cost(old_price: float, old_qty: int,
+                            new_price: float, new_qty: int) -> float:
+    """计算加权平均成本。"""
+    total_qty = old_qty + new_qty
+    if total_qty <= 0:
+        return old_price
+    return (old_price * old_qty + new_price * new_qty) / total_qty
 
 
 def main():
