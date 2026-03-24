@@ -7838,7 +7838,7 @@ def load_portfolio() -> dict:
         return {'version': 1, 'account_size': DEFAULT_ACCOUNT_SIZE, 'holdings': {}}
 
 
-def save_portfolio(portfolio: dict) -> None:
+def save_portfolio(portfolio: dict) -> bool:
     """原子写入持仓 JSON（先写临时文件再 rename，防止写入中断损坏文件）。"""
     path = _get_portfolio_path()
     tmp_path = path + '.tmp'
@@ -7846,12 +7846,14 @@ def save_portfolio(portfolio: dict) -> None:
         with open(tmp_path, 'w', encoding='utf-8') as f:
             json.dump(portfolio, f, ensure_ascii=False, indent=2)
         os.replace(tmp_path, path)
+        return True
     except Exception as e:
         print(f"  警告: 持仓文件保存失败: {e}")
         try:
             os.remove(tmp_path)
         except Exception:
             pass
+        return False
 
 
 def calc_weighted_avg_cost(old_price: float, old_qty: int,
@@ -7894,9 +7896,11 @@ def portfolio_add(code: str, price: float, quantity: int) -> None:
         if new_avg < old_price:
             reduction = (old_price - new_avg) / old_price * 100
             print(f"  新均价: {new_avg:.4f}（成本降低 {reduction:.1f}%）")
-        else:
+        elif new_avg > old_price:
             increase = (new_avg - old_price) / old_price * 100
             print(f"  新均价: {new_avg:.4f}（成本上升 {increase:.1f}%）")
+        else:
+            print(f"  新均价: {new_avg:.4f}（成本不变）")
         print(f"  总持仓: {new_qty} 股")
 
         holdings[code]['entry_price'] = round(new_avg, 4)
@@ -7916,13 +7920,22 @@ def portfolio_add(code: str, price: float, quantity: int) -> None:
         }
         print(f"\n新建持仓 {code}: {quantity} 股 @ {price:.2f}")
 
-    save_portfolio(pf)
-    print("  持仓已保存。")
+    if save_portfolio(pf): print("  持仓已保存。")
 
 
 def portfolio_remove(code: str, quantity: int = None) -> None:
     """减仓或清仓。quantity=None 表示全部清仓。"""
     code = code.upper()
+
+    if quantity is not None and quantity <= 0:
+        print("错误: 卖出数量必须大于0")
+        return
+
+    is_valid, err = validate_stock_code(code)
+    if not is_valid:
+        print(f"错误: {err}")
+        return
+
     pf = load_portfolio()
     holdings = pf.get('holdings', {})
 
@@ -7935,19 +7948,17 @@ def portfolio_remove(code: str, quantity: int = None) -> None:
 
     if quantity is None or quantity >= current_qty:
         # 全部清仓
+        if quantity is not None and quantity > current_qty:
+            print(f"  提示: 卖出数量 ({quantity}) 超过持仓 ({current_qty})，执行全部清仓")
         del holdings[code]
         print(f"\n已清仓 {code}（原持仓 {current_qty} 股）")
     else:
-        if quantity <= 0:
-            print("错误: 卖出数量必须大于0")
-            return
         remaining = current_qty - quantity
         holdings[code]['quantity'] = remaining
         holdings[code]['last_update'] = datetime.now().strftime('%Y-%m-%d')
         print(f"\n减仓 {code}: 卖出 {quantity} 股，剩余 {remaining} 股 @ {holding['entry_price']:.2f}")
 
-    save_portfolio(pf)
-    print("  持仓已更新。")
+    if save_portfolio(pf): print("  持仓已更新。")
 
 
 def portfolio_list() -> None:
