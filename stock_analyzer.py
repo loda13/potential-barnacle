@@ -7758,7 +7758,6 @@ def append_decision_log(code: str, df: pd.DataFrame, price_targets: dict,
     写入失败不影响主流程。
     """
     import csv
-    import os
 
     try:
         log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'trading_decision_log.csv')
@@ -7832,9 +7831,9 @@ def load_portfolio() -> dict:
             data = json.load(f)
         if not isinstance(data.get('holdings'), dict):
             data['holdings'] = {}
+        if not isinstance(data.get('account_size'), (int, float)):
+            data['account_size'] = DEFAULT_ACCOUNT_SIZE
         return data
-    except FileNotFoundError:
-        return {'version': 1, 'account_size': DEFAULT_ACCOUNT_SIZE, 'holdings': {}}
     except Exception:
         return {'version': 1, 'account_size': DEFAULT_ACCOUNT_SIZE, 'holdings': {}}
 
