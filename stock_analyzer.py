@@ -7863,6 +7863,120 @@ def calc_weighted_avg_cost(old_price: float, old_qty: int,
     return (old_price * old_qty + new_price * new_qty) / total_qty
 
 
+def portfolio_add(code: str, price: float, quantity: int) -> None:
+    """添加新持仓或加仓（自动计算加权平均成本）。"""
+    code = code.upper()
+
+    # 验证股票代码格式
+    is_valid, err = validate_stock_code(code)
+    if not is_valid:
+        print(f"错误: {err}")
+        return
+
+    if price <= 0 or quantity <= 0:
+        print("错误: 价格和数量必须大于0")
+        return
+
+    pf = load_portfolio()
+    holdings = pf.setdefault('holdings', {})
+
+    if code in holdings:
+        # 已有持仓：计算加权平均成本
+        old = holdings[code]
+        old_price = old['entry_price']
+        old_qty = old['quantity']
+        new_avg = calc_weighted_avg_cost(old_price, old_qty, price, quantity)
+        new_qty = old_qty + quantity
+
+        print(f"\n加仓 {code}:")
+        print(f"  原持仓: {old_qty} 股 @ {old_price:.2f}")
+        print(f"  本次买入: {quantity} 股 @ {price:.2f}")
+        if new_avg < old_price:
+            reduction = (old_price - new_avg) / old_price * 100
+            print(f"  新均价: {new_avg:.4f}（成本降低 {reduction:.1f}%）")
+        else:
+            increase = (new_avg - old_price) / old_price * 100
+            print(f"  新均价: {new_avg:.4f}（成本上升 {increase:.1f}%）")
+        print(f"  总持仓: {new_qty} 股")
+
+        holdings[code]['entry_price'] = round(new_avg, 4)
+        holdings[code]['quantity'] = new_qty
+        holdings[code]['last_update'] = datetime.now().strftime('%Y-%m-%d')
+    else:
+        # 新建持仓
+        if len(holdings) >= MAX_HOLDINGS:
+            print(f"  警告: 持仓已达 {MAX_HOLDINGS} 只上限，建议控制持仓数量")
+
+        holdings[code] = {
+            'entry_price': round(price, 4),
+            'quantity': quantity,
+            'first_buy_date': datetime.now().strftime('%Y-%m-%d'),
+            'last_update': datetime.now().strftime('%Y-%m-%d'),
+            'notes': '',
+        }
+        print(f"\n新建持仓 {code}: {quantity} 股 @ {price:.2f}")
+
+    save_portfolio(pf)
+    print("  持仓已保存。")
+
+
+def portfolio_remove(code: str, quantity: int = None) -> None:
+    """减仓或清仓。quantity=None 表示全部清仓。"""
+    code = code.upper()
+    pf = load_portfolio()
+    holdings = pf.get('holdings', {})
+
+    if code not in holdings:
+        print(f"错误: 持仓中未找到 {code}")
+        return
+
+    holding = holdings[code]
+    current_qty = holding['quantity']
+
+    if quantity is None or quantity >= current_qty:
+        # 全部清仓
+        del holdings[code]
+        print(f"\n已清仓 {code}（原持仓 {current_qty} 股）")
+    else:
+        if quantity <= 0:
+            print("错误: 卖出数量必须大于0")
+            return
+        remaining = current_qty - quantity
+        holdings[code]['quantity'] = remaining
+        holdings[code]['last_update'] = datetime.now().strftime('%Y-%m-%d')
+        print(f"\n减仓 {code}: 卖出 {quantity} 股，剩余 {remaining} 股 @ {holding['entry_price']:.2f}")
+
+    save_portfolio(pf)
+    print("  持仓已更新。")
+
+
+def portfolio_list() -> None:
+    """打印当前持仓列表（表格格式）。"""
+    pf = load_portfolio()
+    holdings = pf.get('holdings', {})
+
+    print(f"\n{'='*60}")
+    print(f"  当前持仓")
+    print(f"{'='*60}")
+
+    if not holdings:
+        print("  （暂无持仓）")
+        print(f"\n  提示: 使用 'hold add <代码> --price <价格> --qty <数量>' 添加持仓")
+        print(f"{'='*60}")
+        return
+
+    print(f"  {'代码':<12} {'均价':>10} {'持仓数量':>10} {'首次买入':>12} {'最后更新':>12}")
+    print(f"  {'-'*12} {'-'*10} {'-'*10} {'-'*12} {'-'*12}")
+
+    for code, h in holdings.items():
+        print(f"  {code:<12} {h['entry_price']:>10.4f} {h['quantity']:>10} "
+              f"{h.get('first_buy_date', '-'):>12} {h.get('last_update', '-'):>12}")
+
+    print(f"{'='*60}")
+    print(f"  共 {len(holdings)} 只持仓")
+    print(f"{'='*60}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='股票K线技术分析工具',
