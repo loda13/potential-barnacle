@@ -7988,6 +7988,197 @@ def portfolio_list() -> None:
     print(f"{'='*60}")
 
 
+def calc_breakeven_analysis(entry_price: float, quantity: int,
+                             current_price: float, strategy: dict,
+                             price_targets: dict) -> dict:
+    """回本路径分析 — 评估持仓/补仓/止损换股三条路径，推荐最高效方案。
+
+    strategy: 来自 generate_position_strategy() 的返回值（loss mode）
+    price_targets: 来自 calculate_price_targets() 的返回值
+    """
+    if entry_price <= 0 or current_price <= 0 or quantity <= 0:
+        return {'available': False}
+
+    pnl_pct = (current_price - entry_price) / entry_price * 100
+    if pnl_pct >= 0:
+        return {'available': False}  # 已回本，不需要回本分析
+
+    # ── 路径1：持有等待 ──
+    required_gain_pct = (entry_price / current_price - 1) * 100  # 例：亏20% → 需涨25%
+    trend_status = strategy.get('trend_status', 'damaged')
+    circuit_triggered = strategy.get('circuit_triggered', False)
+    decision = strategy.get('decision_raw', '')  # 从strategy中提取原始decision
+
+    if trend_status == 'intact' and required_gain_pct < 15:
+        hold_feasibility = 'high'
+        hold_feasibility_text = '高'
+    elif trend_status == 'broken' or required_gain_pct > 25:
+        hold_feasibility = 'low'
+        hold_feasibility_text = '低'
+    else:
+        hold_feasibility = 'medium'
+        hold_feasibility_text = '中'
+
+    hold_path = {
+        'required_gain_pct': round(required_gain_pct, 1),
+        'feasibility': hold_feasibility,
+        'feasibility_text': hold_feasibility_text,
+    }
+
+    # ── 路径2：补仓摊低成本 ──
+    add_ok = strategy.get('add_ok', False)
+    add_price = strategy.get('add_price') or price_targets.get('buy_price', current_price)
+    add_shares = strategy.get('add_shares') or 0
+    loss_level = strategy.get('loss_level', 'moderate')
+
+    if add_ok and add_price and add_shares and add_shares > 0:
+        new_avg = calc_weighted_avg_cost(entry_price, quantity, add_price, add_shares)
+        cost_reduction_pct = (entry_price - new_avg) / entry_price * 100
+        new_required_gain_pct = (new_avg / current_price - 1) * 100
+        capital_required = add_price * add_shares
+
+        if add_ok and loss_level in ('shallow', 'moderate'):
+            add_feasibility = 'high'
+            add_feasibility_text = '高'
+        elif add_ok and loss_level == 'deep':
+            add_feasibility = 'medium'
+            add_feasibility_text = '中'
+        else:
+            add_feasibility = 'low'
+            add_feasibility_text = '低'
+
+        add_path = {
+            'available': True,
+            'add_price': round(add_price, 2),
+            'add_shares': add_shares,
+            'new_avg_cost': round(new_avg, 4),
+            'cost_reduction_pct': round(cost_reduction_pct, 1),
+            'new_required_gain_pct': round(new_required_gain_pct, 1),
+            'capital_required': round(capital_required, 2),
+            'feasibility': add_feasibility,
+            'feasibility_text': add_feasibility_text,
+        }
+    else:
+        # 补仓条件不满足
+        add_conditions = strategy.get('add_conditions', [])
+        add_path = {
+            'available': False,
+            'feasibility': 'blocked',
+            'feasibility_text': '条件未满足',
+            'blocked_reasons': add_conditions,
+        }
+
+    # ── 路径3：止损换股 ──
+    realized_loss = (current_price - entry_price) * quantity
+    capital_freed = current_price * quantity
+    # 新标的需涨多少才能弥补亏损
+    new_target_gain_pct = abs(pnl_pct) / (1 + abs(pnl_pct) / 100)
+
+    if circuit_triggered or decision in ('SELL', 'LONG_TERM_BEAR', 'VALUE_TRAP'):
+        rotate_feasibility = 'high'
+        rotate_feasibility_text = '高（强烈建议）'
+    elif trend_status == 'broken' and loss_level in ('deep', 'extreme'):
+        rotate_feasibility = 'high'
+        rotate_feasibility_text = '高'
+    else:
+        rotate_feasibility = 'low'
+        rotate_feasibility_text = '低'
+
+    rotate_path = {
+        'realized_loss': round(realized_loss, 2),
+        'realized_loss_pct': round(pnl_pct, 1),
+        'capital_freed': round(capital_freed, 2),
+        'new_target_gain_pct': round(new_target_gain_pct, 1),
+        'feasibility': rotate_feasibility,
+        'feasibility_text': rotate_feasibility_text,
+    }
+
+    # ── 推荐决策 ──
+    if circuit_triggered or decision in ('SELL', 'LONG_TERM_BEAR', 'VALUE_TRAP'):
+        recommendation = 'rotate'
+        recommendation_text = '止损换股'
+        recommendation_reason = '熔断触发或SMC决策明确看空'
+    elif trend_status == 'broken' and loss_level in ('deep', 'extreme'):
+        recommendation = 'rotate'
+        recommendation_text = '止损换股'
+        recommendation_reason = '趋势破坏且亏损深重'
+    elif add_ok and loss_level in ('shallow', 'moderate'):
+        recommendation = 'add'
+        recommendation_text = '补仓摊低成本'
+        recommendation_reason = '技术条件满足，补仓可显著降低回本门槛'
+    elif trend_status == 'intact' and required_gain_pct < 15:
+        recommendation = 'hold'
+        recommendation_text = '持仓等待'
+        recommendation_reason = '趋势完好，所需涨幅在合理范围'
+    elif add_ok:
+        recommendation = 'add'
+        recommendation_text = '补仓摊低成本'
+        recommendation_reason = '技术条件满足补仓'
+    else:
+        recommendation = 'hold'
+        recommendation_text = '持仓等待'
+        recommendation_reason = '暂不满足加仓条件，耐心等待趋势修复'
+
+    return {
+        'available': True,
+        'pnl_pct': round(pnl_pct, 1),
+        'hold_path': hold_path,
+        'add_path': add_path,
+        'rotate_path': rotate_path,
+        'recommendation': recommendation,
+        'recommendation_text': recommendation_text,
+        'recommendation_reason': recommendation_reason,
+    }
+
+
+def _print_breakeven_analysis(analysis: dict) -> None:
+    """打印回本路径分析结果。"""
+    if not analysis.get('available'):
+        return
+
+    print(f"\n{'─'*60}")
+    print(f"  【回本路径分析】当前浮亏 {analysis['pnl_pct']:.1f}%")
+    print(f"{'─'*60}")
+
+    hold = analysis['hold_path']
+    add = analysis['add_path']
+    rotate = analysis['rotate_path']
+    rec = analysis['recommendation']
+
+    # 路径1：持有
+    marker = '★ 推荐' if rec == 'hold' else '  '
+    print(f"\n  {marker} 路径1：持有等待回本")
+    print(f"    需从当前价上涨: +{hold['required_gain_pct']:.1f}%")
+    print(f"    可行性: {hold['feasibility_text']}")
+
+    # 路径2：补仓
+    print(f"\n  {'★ 推荐' if rec == 'add' else '  '} 路径2：补仓摊低成本")
+    if add.get('available'):
+        print(f"    建议买入: {add['add_shares']} 股 @ {add['add_price']:.2f}")
+        print(f"    新均价: {add['new_avg_cost']:.4f}（成本降低 {add['cost_reduction_pct']:.1f}%）")
+        print(f"    新均价回本需上涨: +{add['new_required_gain_pct']:.1f}%")
+        print(f"    所需资金: {add['capital_required']:,.0f}")
+        print(f"    可行性: {add['feasibility_text']}")
+    else:
+        reasons = add.get('blocked_reasons', [])
+        print(f"    状态: 条件未满足")
+        for r in reasons:
+            print(f"      {r}")
+
+    # 路径3：止损换股
+    print(f"\n  {'★ 推荐' if rec == 'rotate' else '  '} 路径3：止损换股")
+    print(f"    实现亏损: {rotate['realized_loss']:,.0f}（{rotate['realized_loss_pct']:.1f}%）")
+    print(f"    释放资金: {rotate['capital_freed']:,.0f}")
+    print(f"    新标的需涨: +{rotate['new_target_gain_pct']:.1f}% 才能弥补亏损")
+    print(f"    可行性: {rotate['feasibility_text']}")
+
+    # 总推荐
+    print(f"\n{'─'*60}")
+    print(f"  ★ 最优路径: 【{analysis['recommendation_text']}】")
+    print(f"  理由: {analysis['recommendation_reason']}")
+    print(f"{'─'*60}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='股票K线技术分析工具',
