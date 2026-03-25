@@ -3161,9 +3161,12 @@ def _calc_loss_strategy(pnl_pct, trend_status, trend_text, stop_urgency, stop_di
         try:
             sizing = calc_position_sizing(current_price, long_stop)
             base_shares = sizing.get('suggested_shares', 0)
-            add_shares = int(base_shares * add_multiplier // 100 * 100) if base_shares else 0
-            if add_shares == 0 and base_shares > 0:
-                add_shares = base_shares  # 至少显示基础股数
+            if base_shares and base_shares > 0:
+                raw = base_shares * add_multiplier
+                # 四舍五入到最近的100股手数，最少100股
+                add_shares = max(round(raw / 100) * 100, 100) if raw >= 50 else 0
+            else:
+                add_shares = 0
         except Exception:
             pass
 
