@@ -2971,9 +2971,21 @@ def generate_position_strategy(df: pd.DataFrame, current_price: float, entry_pri
         death_cross,
         decision in ('SELL', 'LONG_TERM_BEAR', 'VALUE_TRAP'),
     ])
-    if broken_count >= 3 or circuit_triggered:
+    if broken_count >= 3:
         trend_status = 'broken'
         trend_text = '趋势破坏'
+    elif circuit_triggered:
+        # 熔断期间：个股趋势由自身技术面决定，不被大盘一刀切
+        # broken_count 已包含止损击穿、ChoCh反转、死叉、SMC卖出信号
+        if broken_count >= 2:
+            trend_status = 'broken'
+            trend_text = '趋势破坏'
+        elif broken_count >= 1:
+            trend_status = 'damaged'
+            trend_text = '趋势受损（熔断期）'
+        else:
+            trend_status = 'intact'
+            trend_text = '趋势完好（熔断期）'
     elif broken_count >= 1:
         trend_status = 'damaged'
         trend_text = '趋势受损'
@@ -3042,10 +3054,17 @@ def _calc_loss_strategy(pnl_pct, trend_status, trend_text, stop_urgency, stop_di
         loss_level = 'extreme'
         loss_text = f'极度亏损 (>{t_deep:.0f}%)'
 
-    # 减仓建议
-    if circuit_triggered:
+    # 减仓建议（熔断期间：个股趋势破坏才建议清仓，趋势完好则不减仓）
+    if circuit_triggered and trend_status == 'broken':
         reduce_pct = 100
-        reduce_reason = '熔断触发，立即清仓'
+        reduce_reason = '熔断+趋势破坏，建议清仓'
+    elif circuit_triggered and trend_status == 'damaged':
+        reduce_pct = 30
+        reduce_reason = '熔断期间趋势受损，建议减仓30%控制风险'
+    elif circuit_triggered:
+        # 熔断但个股趋势完好，不建议减仓
+        reduce_pct = 0
+        reduce_reason = ''
     elif decision in ('SELL', 'LONG_TERM_BEAR', 'VALUE_TRAP'):
         reduce_pct = 100
         reduce_reason = 'SMC决策为卖出，建议清仓'
@@ -3059,7 +3078,7 @@ def _calc_loss_strategy(pnl_pct, trend_status, trend_text, stop_urgency, stop_di
         reduce_pct = 0
         reduce_reason = ''
 
-    # 加仓评估
+    # 加仓评估（分级制：blocked/cautious/normal/aggressive）
     contrarian_score = contrarian.get('composite_score', 0) if contrarian else 0
     zscore_val = None
     try:
@@ -3068,33 +3087,71 @@ def _calc_loss_strategy(pnl_pct, trend_status, trend_text, stop_urgency, stop_di
     except Exception:
         pass
 
+    # 从三重背离信号提取看多背离
+    has_bullish_divergence = False
+    try:
+        divergence = contrarian.get('divergence', {}) if contrarian else {}
+        div_signal = divergence.get('signal', '')
+        has_bullish_divergence = 'bullish' in div_signal.lower() or div_signal in ('double_bullish', 'triple_bullish')
+    except Exception:
+        pass
+
     add_conditions = []
-    add_ok = True
+    add_grade = 'blocked'  # blocked / cautious / normal / aggressive
 
     if loss_level == 'extreme':
-        add_ok = False
+        add_grade = 'blocked'
         add_conditions.append('✗ 极度亏损禁止加仓')
+    elif trend_status == 'broken':
+        add_grade = 'blocked'
+        add_conditions.append('✗ 趋势已破坏')
+    elif trend_status == 'damaged':
+        # 趋势受损：需要至少1个左侧信号确认
+        add_conditions.append('△ 趋势受损，需左侧信号确认')
+        if contrarian_score >= 55 or has_bullish_divergence:
+            add_grade = 'cautious'
+            if contrarian_score >= 55:
+                add_conditions.append(f'✓ 左侧评分 {contrarian_score} ≥ 55')
+            if has_bullish_divergence:
+                add_conditions.append('✓ 检测到看多背离')
+        else:
+            add_grade = 'blocked'
+            add_conditions.append(f'✗ 左侧评分 {contrarian_score} < 55 且无背离信号')
     else:
-        if trend_status == 'broken':
-            add_ok = False
-            add_conditions.append('✗ 趋势已破坏')
-        else:
-            add_conditions.append('✓ 趋势未破坏')
-
-        if contrarian_score >= 65:
-            add_conditions.append(f'✓ 左侧评分 {contrarian_score} ≥ 65')
-        else:
-            add_ok = False
-            add_conditions.append(f'✗ 左侧评分 {contrarian_score} < 65')
-
-        if zscore_val is not None:
-            if zscore_val < -1.5:
-                add_conditions.append(f'✓ Z-Score {zscore_val:.2f} < -1.5')
+        # 趋势完好：宽松条件
+        add_conditions.append('✓ 趋势完好')
+        if contrarian_score >= 65 and has_bullish_divergence:
+            add_grade = 'aggressive'
+            add_conditions.append(f'✓ 左侧评分 {contrarian_score} ≥ 65 + 看多背离')
+        elif contrarian_score >= 45 or loss_level == 'shallow':
+            add_grade = 'normal'
+            if contrarian_score >= 45:
+                add_conditions.append(f'✓ 左侧评分 {contrarian_score} ≥ 45')
             else:
-                add_ok = False
-                add_conditions.append(f'✗ Z-Score {zscore_val:.2f} ≥ -1.5（未超卖）')
+                add_conditions.append(f'✓ 浅度亏损，趋势完好可加仓')
         else:
-            add_conditions.append('— Z-Score 数据不足，跳过')
+            add_grade = 'cautious'
+            add_conditions.append(f'△ 左侧评分 {contrarian_score} < 45，谨慎加仓')
+
+    # Z-Score 作为参考信息（不再作为硬性门禁）
+    if zscore_val is not None:
+        if zscore_val < -2.0:
+            add_conditions.append(f'✓ Z-Score {zscore_val:.2f} 极度超卖')
+            if add_grade == 'normal':
+                add_grade = 'aggressive'
+        elif zscore_val < -1.5:
+            add_conditions.append(f'✓ Z-Score {zscore_val:.2f} 超卖')
+        else:
+            add_conditions.append(f'— Z-Score {zscore_val:.2f}（未超卖，仅供参考）')
+    else:
+        add_conditions.append('— Z-Score 数据不足，跳过')
+
+    # 向后兼容：保留 add_ok 字段（True 表示 grade != blocked）
+    add_ok = add_grade != 'blocked'
+
+    # 加仓仓位系数
+    grade_multiplier = {'blocked': 0, 'cautious': 0.5, 'normal': 1.0, 'aggressive': 1.5}
+    add_multiplier = grade_multiplier.get(add_grade, 0)
 
     # 加仓价位和股数
     add_price = None
@@ -3103,7 +3160,10 @@ def _calc_loss_strategy(pnl_pct, trend_status, trend_text, stop_urgency, stop_di
         add_price = price_targets.get('buy_price', current_price)
         try:
             sizing = calc_position_sizing(current_price, long_stop)
-            add_shares = sizing.get('suggested_shares', 0)
+            base_shares = sizing.get('suggested_shares', 0)
+            add_shares = int(base_shares * add_multiplier // 100 * 100) if base_shares else 0
+            if add_shares == 0 and base_shares > 0:
+                add_shares = base_shares  # 至少显示基础股数
         except Exception:
             pass
 
@@ -3128,6 +3188,8 @@ def _calc_loss_strategy(pnl_pct, trend_status, trend_text, stop_urgency, stop_di
         'stop_dist_pct': round(stop_dist_pct, 2) if stop_dist_pct is not None else None,
         'stop_urgency': stop_urgency,
         'add_ok': add_ok,
+        'add_grade': add_grade,
+        'add_multiplier': add_multiplier,
         'add_conditions': add_conditions,
         'add_price': add_price,
         'add_shares': add_shares,
@@ -5914,17 +5976,19 @@ def _print_loss_response(strategy: dict, entry_price: float, current_price: floa
         print(f"    止损价: 数据不足")
 
     print(f"\n  【加仓评估】")
-    if strategy['add_ok']:
-        print(f"    ✓ 满足加仓条件")
-        for cond in strategy['add_conditions']:
-            print(f"      {cond}")
-        if strategy['add_price'] and strategy['add_shares']:
-            print(f"    建议价位: {strategy['add_price']:.2f}")
-            print(f"    建议股数: {strategy['add_shares']} 股")
-    else:
-        print(f"    ✗ 不满足加仓条件")
-        for cond in strategy['add_conditions']:
-            print(f"      {cond}")
+    grade = strategy.get('add_grade', 'blocked' if not strategy.get('add_ok') else 'normal')
+    grade_label = {
+        'blocked': '✗ 禁止加仓',
+        'cautious': '△ 谨慎加仓（建议仓位×0.5）',
+        'normal': '✓ 可以加仓（标准仓位）',
+        'aggressive': '★ 积极加仓（建议仓位×1.5）',
+    }.get(grade, '✗ 禁止加仓')
+    print(f"    {grade_label}")
+    for cond in strategy['add_conditions']:
+        print(f"      {cond}")
+    if strategy.get('add_ok') and strategy.get('add_price') and strategy.get('add_shares'):
+        print(f"    建议价位: {strategy['add_price']:.2f}")
+        print(f"    建议股数: {strategy['add_shares']} 股（仓位系数 ×{strategy.get('add_multiplier', 1.0):.1f}）")
 
     if strategy['reduce_pct'] > 0:
         print(f"\n  【减仓建议】")
@@ -5937,10 +6001,15 @@ def _print_loss_response(strategy: dict, entry_price: float, current_price: floa
     print(f"    理性操作: {strategy['rational_action']}")
 
     print(f"\n  ── 策略总结 ──")
+    grade = strategy.get('add_grade', 'blocked' if not strategy.get('add_ok') else 'normal')
     if strategy['reduce_pct'] > 0:
         print(f"  当前建议: 减仓 {strategy['reduce_pct']}%")
-    elif strategy['add_ok']:
-        print(f"  当前建议: 可考虑加仓，但需等待右侧确认")
+    elif grade == 'aggressive':
+        print(f"  当前建议: 积极加仓，技术面强烈支持")
+    elif grade == 'normal':
+        print(f"  当前建议: 可加仓摊低成本，等待右侧确认")
+    elif grade == 'cautious':
+        print(f"  当前建议: 谨慎加仓（半仓），信号尚不充分")
     else:
         print(f"  当前建议: 持仓观望，严守止损")
 
@@ -8090,6 +8159,8 @@ def calc_breakeven_analysis(entry_price: float, quantity: int,
             'capital_required': round(capital_required, 2),
             'feasibility': add_feasibility,
             'feasibility_text': add_feasibility_text,
+            'add_grade': strategy.get('add_grade', 'normal'),
+            'add_grade_text': {'cautious': '谨慎加仓', 'normal': '标准加仓', 'aggressive': '积极加仓'}.get(strategy.get('add_grade', 'normal'), '标准加仓'),
         }
     else:
         if add_ok:
@@ -8115,12 +8186,17 @@ def calc_breakeven_analysis(entry_price: float, quantity: int,
     # 新标的需涨多少才能弥补亏损
     new_target_gain_pct = (entry_price / current_price - 1) * 100
 
-    if circuit_triggered or decision in ('SELL', 'LONG_TERM_BEAR', 'VALUE_TRAP'):
+    # 止损换股可行性：只有熔断+趋势破坏，或SMC明确看空，才强烈建议换股
+    if (circuit_triggered and trend_status == 'broken' and loss_level in ('deep', 'extreme')) or \
+       decision in ('SELL', 'LONG_TERM_BEAR', 'VALUE_TRAP'):
         rotate_feasibility = 'high'
         rotate_feasibility_text = '高（强烈建议）'
     elif trend_status == 'broken' and loss_level in ('deep', 'extreme'):
         rotate_feasibility = 'high'
         rotate_feasibility_text = '高'
+    elif circuit_triggered and trend_status != 'intact':
+        rotate_feasibility = 'medium'
+        rotate_feasibility_text = '中（熔断期可考虑）'
     else:
         rotate_feasibility = 'low'
         rotate_feasibility_text = '低'
@@ -8135,14 +8211,15 @@ def calc_breakeven_analysis(entry_price: float, quantity: int,
     }
 
     # ── 推荐决策 ──
-    if circuit_triggered or decision in ('SELL', 'LONG_TERM_BEAR', 'VALUE_TRAP'):
+    # 只有熔断+趋势破坏+深度亏损，或SMC明确看空，才推荐换股
+    if decision in ('SELL', 'LONG_TERM_BEAR', 'VALUE_TRAP'):
         recommendation = 'rotate'
         recommendation_text = '止损换股'
-        recommendation_reason = '熔断触发或SMC决策明确看空'
-    elif trend_status == 'broken' and loss_level in ('deep', 'extreme'):
+        recommendation_reason = 'SMC决策明确看空'
+    elif circuit_triggered and trend_status == 'broken' and loss_level in ('deep', 'extreme'):
         recommendation = 'rotate'
         recommendation_text = '止损换股'
-        recommendation_reason = '趋势破坏且亏损深重'
+        recommendation_reason = '熔断+趋势破坏+深度亏损'
     elif add_ok and loss_level in ('shallow', 'moderate'):
         recommendation = 'add'
         recommendation_text = '补仓摊低成本'
@@ -8200,6 +8277,8 @@ def _print_breakeven_analysis(analysis: dict) -> None:
         print(f"    新均价回本需上涨: +{add['new_required_gain_pct']:.1f}%")
         print(f"    所需资金: {add['capital_required']:,.0f}")
         print(f"    可行性: {add['feasibility_text']}")
+        if add.get('available') and add.get('add_grade'):
+            print(f"    加仓力度: {add.get('add_grade_text', '标准加仓')}")
     else:
         reasons = add.get('blocked_reasons', [])
         print(f"    状态: 条件未满足")
