@@ -7755,6 +7755,7 @@ def print_portfolio_analysis(results: dict, period: str = 'w'):
     print(comparison_df.to_string(index=False))
 
     # 2. 逐个打印详细分析
+    _pf = load_portfolio()
     for code, analysis in results['results'].items():
         if 'error' in analysis:
             print(f"\n{'='*80}")
@@ -7769,9 +7770,10 @@ def print_portfolio_analysis(results: dict, period: str = 'w'):
 
         # 复用 print_analysis 的核心逻辑
         df = analysis['df']
-        # 从持仓文件获取成本价
-        _pf = load_portfolio()
-        _ep = _pf.get('holdings', {}).get(code, {}).get('entry_price')
+        # 从持仓文件获取成本价（支持原始代码和去后缀代码两种格式）
+        _pf_holdings = _pf.get('holdings', {})
+        _raw_code = code.replace('.SS', '').replace('.SZ', '').replace('.HK', '').replace('.TW', '')
+        _ep = (_pf_holdings.get(code) or _pf_holdings.get(_raw_code) or {}).get('entry_price')
         print_analysis(
             df, code, period,
             demo=False,
@@ -8228,6 +8230,7 @@ def _print_portfolio_summary(portfolio: dict, current_prices: dict) -> None:
     total_value = 0.0
     rows = []
 
+    has_missing = False
     for code, h in holdings.items():
         ep = h['entry_price']
         qty = h['quantity']
@@ -8240,6 +8243,7 @@ def _print_portfolio_summary(portfolio: dict, current_prices: dict) -> None:
             pnl_pct = (cp - ep) / ep * 100
             rows.append((code, ep, cp, qty, pnl_pct))
         else:
+            has_missing = True
             rows.append((code, ep, None, qty, None))
 
     print(f"\n{'='*70}")
@@ -8258,8 +8262,9 @@ def _print_portfolio_summary(portfolio: dict, current_prices: dict) -> None:
 
     if total_cost > 0 and total_value > 0:
         total_pnl_pct = (total_value - total_cost) / total_cost * 100
+        missing_note = '（部分数据不可用）' if has_missing else ''
         print(f"{'─'*70}")
-        print(f"  总成本: {total_cost:,.0f}  |  总市值: {total_value:,.0f}  |  总浮盈亏: {total_pnl_pct:+.1f}%")
+        print(f"  总成本: {total_cost:,.0f}  |  总市值: {total_value:,.0f}  |  总浮盈亏: {total_pnl_pct:+.1f}%{missing_note}")
     print(f"{'='*70}")
 
 
@@ -8290,7 +8295,11 @@ def run_holdings_analysis(codes: list = None, period: str = 'w',
     # 逐股获取数据并分析
     current_prices = {}
     for code in target_codes:
-        ep = holdings[code]['entry_price']
+        ep = holdings[code].get('entry_price')
+        qty = holdings[code].get('quantity', 0)
+        if not ep:
+            print(f"  警告: {code} 持仓数据不完整，跳过")
+            continue
 
         print(f"\n{'='*80}")
         print(f"正在获取 {code} 数据...")
