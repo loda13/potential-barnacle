@@ -8039,15 +8039,12 @@ def calc_breakeven_analysis(entry_price: float, quantity: int,
         new_required_gain_pct = (new_avg / current_price - 1) * 100
         capital_required = add_price * add_shares
 
-        if add_ok and loss_level in ('shallow', 'moderate'):
-            add_feasibility = 'high'
-            add_feasibility_text = '高'
-        elif add_ok and loss_level == 'deep':
-            add_feasibility = 'medium'
-            add_feasibility_text = '中'
+        if loss_level in ('shallow', 'moderate'):
+            add_feasibility, add_feasibility_text = 'high', '高'
+        elif loss_level == 'deep':
+            add_feasibility, add_feasibility_text = 'medium', '中'
         else:
-            add_feasibility = 'low'
-            add_feasibility_text = '低'
+            add_feasibility, add_feasibility_text = 'low', '低'
 
         add_path = {
             'available': True,
@@ -8061,20 +8058,28 @@ def calc_breakeven_analysis(entry_price: float, quantity: int,
             'feasibility_text': add_feasibility_text,
         }
     else:
-        # 补仓条件不满足
-        add_conditions = strategy.get('add_conditions', [])
-        add_path = {
-            'available': False,
-            'feasibility': 'blocked',
-            'feasibility_text': '条件未满足',
-            'blocked_reasons': add_conditions,
-        }
+        if add_ok:
+            # 条件满足但仓位计算失败（止损价不可用）
+            add_path = {
+                'available': False,
+                'feasibility': 'blocked',
+                'feasibility_text': '仓位计算失败',
+                'blocked_reasons': ['✗ 无法计算建议股数（止损价不可用）'],
+            }
+        else:
+            add_conditions = strategy.get('add_conditions', [])
+            add_path = {
+                'available': False,
+                'feasibility': 'blocked',
+                'feasibility_text': '条件未满足',
+                'blocked_reasons': add_conditions,
+            }
 
     # ── 路径3：止损换股 ──
     realized_loss = (current_price - entry_price) * quantity
     capital_freed = current_price * quantity
     # 新标的需涨多少才能弥补亏损
-    new_target_gain_pct = abs(pnl_pct) / (1 + abs(pnl_pct) / 100)
+    new_target_gain_pct = (entry_price / current_price - 1) * 100
 
     if circuit_triggered or decision in ('SELL', 'LONG_TERM_BEAR', 'VALUE_TRAP'):
         rotate_feasibility = 'high'
