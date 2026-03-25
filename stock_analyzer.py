@@ -8255,10 +8255,9 @@ def _print_portfolio_summary(portfolio: dict, current_prices: dict) -> None:
     for code, ep, cp, qty, pnl_pct in rows:
         if cp is not None and pnl_pct is not None:
             pnl_str = f"{pnl_pct:+.1f}%"
+            print(f"  {code:<12} {ep:>8.2f} {cp:>8.2f} {qty:>8} {pnl_str:>10}")
         else:
-            pnl_str = "数据不可用"
-            cp = 0.0
-        print(f"  {code:<12} {ep:>8.2f} {cp:>8.2f} {qty:>8} {pnl_str:>10}")
+            print(f"  {code:<12} {ep:>8.2f} {'N/A':>8} {qty:>8} {'数据不可用':>10}")
 
     if total_cost > 0 and total_value > 0:
         total_pnl_pct = (total_value - total_cost) / total_cost * 100
@@ -8404,6 +8403,15 @@ def main():
 
   # 执行压力测试
   python stock_analyzer.py NVDA -d 60 --stress-test
+
+持仓管理 (hold 子命令):
+  python stock_analyzer.py hold add NVDA --price 125.50 --qty 200   # 建仓
+  python stock_analyzer.py hold add NVDA --price 118.00 --qty 100   # 加仓（自动计算均价）
+  python stock_analyzer.py hold remove NVDA --qty 100               # 减仓
+  python stock_analyzer.py hold remove NVDA                         # 清仓
+  python stock_analyzer.py hold list                                # 查看持仓
+  python stock_analyzer.py hold run                                 # 每日分析全部持仓
+  python stock_analyzer.py hold run NVDA -d 120                     # 分析单只持仓
         '''
     )
 
