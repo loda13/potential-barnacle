@@ -1,6 +1,6 @@
 # 股票长线投资分析系统
 
-命令行股票分析工具，支持A股/美股/港股/台股。从短线交易工具升级为**长线投资与基本面体检系统**，集成 SMC 决策树、多周期共振、基本面扫雷、聪明钱追踪、行业相对强弱和多层否决机制。
+命令行股票分析工具，支持A股/美股/港股/台股。集成 SMC 决策树、多周期共振、基本面扫雷、聪明钱追踪、行业相对强弱、多层否决机制，以及**持仓成本管理与回本加速系统**。
 
 ## 安装
 
@@ -33,6 +33,29 @@ python3 stock_analyzer.py NVDA -d 120 --entry-price 170.5
 python3 stock_analyzer.py TSLA --demo
 ```
 
+### 持仓管理（v6.0 新增）
+
+```bash
+# 建仓 / 加仓（自动计算加权均价）
+python3 stock_analyzer.py hold add NVDA --price 178 --qty 200
+python3 stock_analyzer.py hold add NVDA --price 165 --qty 100   # 均价自动更新
+
+# 减仓 / 清仓
+python3 stock_analyzer.py hold remove NVDA --qty 100
+python3 stock_analyzer.py hold remove NVDA
+
+# 查看持仓
+python3 stock_analyzer.py hold list
+
+# 每日分析全部持仓（自动读取成本价，无需每次手动输入）
+python3 stock_analyzer.py hold run -d 120
+
+# 分析单只持仓
+python3 stock_analyzer.py hold run NVDA -d 120
+```
+
+持仓信息保存在 `portfolio.json`（与脚本同目录，已加入 `.gitignore`）。
+
 ## 参数说明
 
 | 参数 | 说明 | 默认值 |
@@ -50,10 +73,11 @@ python3 stock_analyzer.py TSLA --demo
 ### 文件结构
 
 ```
-stock_analyzer.py      # 主程序（~7900行）
+stock_analyzer.py      # 主程序（~8500行）
 ├── fundamentals.py    # 基本面扫雷：稀释检测、ROE/FCF质量、退市风险、价值陷阱否决
 ├── smart_money.py     # 聪明钱动向：内部人士交易、机构持股、综合确认
 ├── sector_analysis.py # 行业相对强弱：行业RS线、财报波动统计、宏观熊市检查
+├── portfolio.json     # 持仓文件（自动生成，已加入.gitignore）
 └── trading_decision_log.csv  # 执行日志（自动追加）
 ```
 
@@ -104,6 +128,8 @@ stock_analyzer.py      # 主程序（~7900行）
 | **右侧交易** | stock_analyzer.py | BoS、ChoCh、多时间框架共振（日线×周线×月线） |
 | **风控** | stock_analyzer.py | Chandelier Exit 止损、黑天鹅熔断、VIX 监控、回撤分析 |
 | **持仓应对策略** | stock_analyzer.py | 亏损/盈利分级管理、分批止盈、VWAP偏离预警、加仓禁区检测 |
+| **持仓管理** | stock_analyzer.py | `hold` 子命令：建仓/加仓/减仓/清仓，加权均价计算，portfolio.json 持久化 |
+| **回本路径分析** | stock_analyzer.py | 三路径评估（持有/补仓/止损换股），分级加仓建议（谨慎/标准/积极），熔断期豁免 |
 
 ### 输出区块顺序
 
