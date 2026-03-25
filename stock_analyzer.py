@@ -7233,23 +7233,39 @@ def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False,
         pos_entry_price = entry_price
         entry_source = '命令行参数'
         has_position = True  # 指定了买入价则视为有持仓
-    elif has_position:
+    else:
+        # 尝试从持仓文件获取（优先级：持仓文件 > Volume Profile POC > 60日均价）
         try:
-            # 尝试从 Volume Profile 获取 POC
-            vol_profile = context.get('volume_profile', {})
-            if vol_profile and vol_profile.get('poc'):
-                pos_entry_price = vol_profile['poc']
-                entry_source = 'Volume Profile POC'
-            else:
-                # 使用 60 日均价
-                if len(df) >= 60:
-                    pos_entry_price = df['close'].tail(60).mean()
-                    entry_source = '60日均价估算'
-                else:
-                    pos_entry_price = df['close'].mean()
-                    entry_source = f'{len(df)}日均价估算'
+            pf = load_portfolio()
+            pf_holdings = pf.get('holdings', {})
+            # 尝试原始代码和去后缀代码两种格式
+            raw_code = code.replace('.SS', '').replace('.SZ', '').replace('.HK', '').replace('.TW', '')
+            for pf_code in [code, raw_code]:
+                if pf_code in pf_holdings:
+                    pos_entry_price = pf_holdings[pf_code]['entry_price']
+                    entry_source = '持仓文件'
+                    has_position = True
+                    break
         except Exception:
             pass
+
+        if pos_entry_price is None and has_position:
+            try:
+                # 尝试从 Volume Profile 获取 POC
+                vol_profile = context.get('volume_profile', {})
+                if vol_profile and vol_profile.get('poc'):
+                    pos_entry_price = vol_profile['poc']
+                    entry_source = 'Volume Profile POC'
+                else:
+                    # 使用 60 日均价
+                    if len(df) >= 60:
+                        pos_entry_price = df['close'].tail(60).mean()
+                        entry_source = '60日均价估算'
+                    else:
+                        pos_entry_price = df['close'].mean()
+                        entry_source = f'{len(df)}日均价估算'
+            except Exception:
+                pass
 
     if has_position and pos_entry_price and pos_entry_price > 0:
         try:
@@ -7268,6 +7284,18 @@ def print_analysis(df: pd.DataFrame, code: str, period: str, demo: bool = False,
             if position_strategy.get('available'):
                 if position_strategy['mode'] == 'loss':
                     _print_loss_response(position_strategy, pos_entry_price, current_price)
+                    # 回本路径分析（仅亏损时）
+                    try:
+                        circuit_triggered = dashboard.get('circuit_breaker_triggered', False)
+                        breakeven = calc_breakeven_analysis(
+                            pos_entry_price, 1, current_price,
+                            position_strategy, price_targets,
+                            circuit_triggered=circuit_triggered,
+                            decision=decision,
+                        )
+                        _print_breakeven_analysis(breakeven)
+                    except Exception:
+                        pass
                 else:
                     _print_profit_response(position_strategy, pos_entry_price, current_price)
 
@@ -7741,10 +7769,14 @@ def print_portfolio_analysis(results: dict, period: str = 'w'):
 
         # 复用 print_analysis 的核心逻辑
         df = analysis['df']
+        # 从持仓文件获取成本价
+        _pf = load_portfolio()
+        _ep = _pf.get('holdings', {}).get(code, {}).get('entry_price')
         print_analysis(
             df, code, period,
             demo=False,
-            stress_test=(analysis.get('stress_result') is not None)
+            stress_test=(analysis.get('stress_result') is not None),
+            entry_price=_ep,
         )
 
 
@@ -8186,7 +8218,164 @@ def _print_breakeven_analysis(analysis: dict) -> None:
     print(f"{'─'*60}")
 
 
+def _print_portfolio_summary(portfolio: dict, current_prices: dict) -> None:
+    """打印组合级 P&L 汇总。current_prices: {code: float}"""
+    holdings = portfolio.get('holdings', {})
+    if not holdings:
+        return
+
+    total_cost = 0.0
+    total_value = 0.0
+    rows = []
+
+    for code, h in holdings.items():
+        ep = h['entry_price']
+        qty = h['quantity']
+        cp = current_prices.get(code)
+        cost = ep * qty
+        total_cost += cost
+        if cp:
+            value = cp * qty
+            total_value += value
+            pnl_pct = (cp - ep) / ep * 100
+            rows.append((code, ep, cp, qty, pnl_pct))
+        else:
+            rows.append((code, ep, None, qty, None))
+
+    print(f"\n{'='*70}")
+    print(f"  【持仓组合汇总】")
+    print(f"{'='*70}")
+    print(f"  {'代码':<12} {'均价':>8} {'现价':>8} {'持仓':>8} {'浮盈亏':>10}")
+    print(f"  {'-'*12} {'-'*8} {'-'*8} {'-'*8} {'-'*10}")
+
+    for code, ep, cp, qty, pnl_pct in rows:
+        if cp is not None and pnl_pct is not None:
+            pnl_str = f"{pnl_pct:+.1f}%"
+        else:
+            pnl_str = "数据不可用"
+            cp = 0.0
+        print(f"  {code:<12} {ep:>8.2f} {cp:>8.2f} {qty:>8} {pnl_str:>10}")
+
+    if total_cost > 0 and total_value > 0:
+        total_pnl_pct = (total_value - total_cost) / total_cost * 100
+        print(f"{'─'*70}")
+        print(f"  总成本: {total_cost:,.0f}  |  总市值: {total_value:,.0f}  |  总浮盈亏: {total_pnl_pct:+.1f}%")
+    print(f"{'='*70}")
+
+
+def run_holdings_analysis(codes: list = None, period: str = 'w',
+                           days: int = 1000, demo: bool = False) -> None:
+    """持仓每日分析主入口。从 portfolio.json 加载持仓，逐股分析并传入真实成本价。"""
+    pf = load_portfolio()
+    holdings = pf.get('holdings', {})
+
+    if not holdings:
+        print("持仓为空。使用 'hold add <代码> --price <价格> --qty <数量>' 添加持仓。")
+        return
+
+    # 确定要分析的股票列表
+    if codes:
+        target_codes = [c.upper() for c in codes if c.upper() in holdings]
+        missing = [c.upper() for c in codes if c.upper() not in holdings]
+        if missing:
+            print(f"  提示: {', '.join(missing)} 不在持仓中，已跳过")
+        if not target_codes:
+            print("指定的股票均不在持仓中。")
+            return
+    else:
+        target_codes = list(holdings.keys())
+
+    print(f"\n正在分析持仓（{len(target_codes)} 只）...")
+
+    # 逐股获取数据并分析
+    current_prices = {}
+    for code in target_codes:
+        ep = holdings[code]['entry_price']
+
+        print(f"\n{'='*80}")
+        print(f"正在获取 {code} 数据...")
+
+        try:
+            df = fetch_stock_data(code, period, days, demo=demo)
+            if df.empty:
+                print(f"  错误: 无法获取 {code} 数据")
+                continue
+
+            is_valid, error_msg, df_clean = validate_data(df, min_rows=30)
+            if not is_valid:
+                print(f"  错误: {code} 数据验证失败: {error_msg}")
+                continue
+
+            # 记录当前价格用于汇总
+            current_prices[code] = df_clean.iloc[-1]['close']
+
+            # 使用真实成本价进行分析
+            print_analysis(df_clean, code, period, demo=demo, entry_price=ep)
+
+        except Exception as e:
+            print(f"  分析 {code} 时出错: {e}")
+            continue
+
+    # 打印组合汇总
+    _print_portfolio_summary(pf, current_prices)
+
+
+def handle_hold_command(args) -> None:
+    """hold 子命令分发器。"""
+    action = getattr(args, 'hold_action', None)
+
+    if action == 'add':
+        portfolio_add(args.code, args.price, args.qty)
+    elif action == 'remove':
+        portfolio_remove(args.code, getattr(args, 'qty', None))
+    elif action == 'list':
+        portfolio_list()
+    elif action == 'run':
+        codes = [args.run_code] if getattr(args, 'run_code', None) else None
+        run_holdings_analysis(
+            codes=codes,
+            period=getattr(args, 'period', 'w'),
+            days=getattr(args, 'days', 1000),
+            demo=getattr(args, 'demo', False),
+        )
+    else:
+        print("用法: stock_analyzer.py hold {add|remove|list|run} ...")
+        print("  hold add <代码> --price <价格> --qty <数量>   建仓/加仓")
+        print("  hold remove <代码> [--qty <数量>]             减仓/清仓")
+        print("  hold list                                     查看持仓")
+        print("  hold run [代码] [-d 天数] [-p 周期]           每日分析")
+
+
 def main():
+    import sys as _sys
+
+    # ── hold 子命令：在主 argparse 之前拦截，避免与 code 位置参数冲突 ──
+    _argv = _sys.argv[1:]
+    if _argv and _argv[0] == 'hold':
+        _hold_parser = argparse.ArgumentParser(prog='stock_analyzer.py hold')
+        _hold_sub = _hold_parser.add_subparsers(dest='hold_action')
+
+        _add_p = _hold_sub.add_parser('add', help='建仓/加仓')
+        _add_p.add_argument('code', help='股票代码')
+        _add_p.add_argument('--price', type=float, required=True, help='买入价格')
+        _add_p.add_argument('--qty', type=int, required=True, help='买入股数')
+
+        _rm_p = _hold_sub.add_parser('remove', help='减仓/清仓')
+        _rm_p.add_argument('code', help='股票代码')
+        _rm_p.add_argument('--qty', type=int, default=None, help='卖出股数（不指定则全部清仓）')
+
+        _hold_sub.add_parser('list', help='查看持仓')
+
+        _run_p = _hold_sub.add_parser('run', help='持仓每日分析')
+        _run_p.add_argument('run_code', nargs='?', help='指定单只股票（不指定则分析全部持仓）')
+        _run_p.add_argument('-d', '--days', type=int, default=1000, help='分析天数')
+        _run_p.add_argument('-p', '--period', choices=['d', 'w', 'm'], default='w', help='K线周期')
+        _run_p.add_argument('--demo', action='store_true', help='演示模式')
+
+        _hold_args = _hold_parser.parse_args(_argv[1:])
+        handle_hold_command(_hold_args)
+        return
+
     parser = argparse.ArgumentParser(
         description='股票K线技术分析工具',
         formatter_class=argparse.RawDescriptionHelpFormatter,
